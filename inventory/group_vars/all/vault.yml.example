@@ -1,0 +1,20 @@
+# Copy this file to vault.yml and encrypt with:
+#   cp vault.yml.example vault.yml
+#   ansible-vault encrypt vault.yml
+#
+# Or create encrypted file directly:
+#   ansible-vault create vault.yml
+
+# ===========================================
+# RabbitMQ Admin Password
+# Used for management UI and federation
+# ===========================================
+vault_rmq_admin_password: "secure-rmq-password"
+
+# ===========================================
+# Broadcom Tanzu RabbitMQ Repository Access
+# REQUIRED ONLY IF local RPM is missing in bin/
+# Get token from: https://support.broadcom.com
+# ===========================================
+broadcom_user: "your-email@example.com"
+broadcom_token: "your-api-token"

@@ -1,0 +1,132 @@
+---
+# Health check for RabbitMQ clusters
+#
+# Usage:
+#   ansible-playbook playbooks/health_check.yml
+#
+- name: RabbitMQ Cluster Health Check
+  hosts: nodes
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Check RabbitMQ service status
+      ansible.builtin.systemd:
+        name: tanzu-rabbitmq-server
+      register: rmq_service
+
+    - name: Verify RabbitMQ is running
+      ansible.builtin.assert:
+        that:
+          - rmq_service.status.ActiveState == "active"
+        fail_msg: "RabbitMQ is not running on {{ inventory_hostname }}"
+        success_msg: "RabbitMQ is running"
+
+    - name: Get cluster status
+      ansible.builtin.command: rabbitmqctl cluster_status --formatter json
+      register: cluster_status
+      changed_when: false
+
+    - name: Parse cluster info
+      ansible.builtin.set_fact:
+        cluster_info: "{{ cluster_status.stdout | from_json }}"
+
+    - name: Display cluster membership
+      ansible.builtin.debug:
+        msg: |
+          Node: {{ inventory_hostname }}
+          Cluster: {{ cluster_info.cluster_name | default('unknown') }}
+          Running nodes: {{ cluster_info.running_nodes | join(', ') }}
+          Alarms: {{ cluster_info.alarms | default([]) | length }}
+
+    - name: Check for alarms
+      ansible.builtin.assert:
+        that:
+          - (cluster_info.alarms | default([]) | length) == 0
+        fail_msg: "ALARM: {{ cluster_info.alarms }}"
+        success_msg: "No alarms"
+
+    - name: Check for network partitions
+      ansible.builtin.assert:
+        that:
+          - (cluster_info.partitions | default([]) | length) == 0
+        fail_msg: "NETWORK PARTITION DETECTED: {{ cluster_info.partitions }}"
+        success_msg: "No network partitions"
+
+- name: Check AZ-Cluster-1
+  hosts: "{{ groups['az-cluster-1'][0] }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Verify AZ-Cluster-1 cluster size
+      ansible.builtin.command: rabbitmqctl cluster_status --formatter json
+      register: az1_status
+      changed_when: false
+
+    - name: Assert AZ-Cluster-1 has 3 nodes
+      ansible.builtin.assert:
+        that:
+          - (az1_status.stdout | from_json).running_nodes | length == 3
+        fail_msg: "AZ-Cluster-1 should have 3 nodes, found {{ (az1_status.stdout | from_json).running_nodes | length }}"
+        success_msg: "AZ-Cluster-1 has 3 healthy nodes"
+
+- name: Check AZ-Cluster-2
+  hosts: "{{ groups['az-cluster-2'][0] }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Verify AZ-Cluster-2 cluster size
+      ansible.builtin.command: rabbitmqctl cluster_status --formatter json
+      register: az2_status
+      changed_when: false
+
+    - name: Assert AZ-Cluster-2 has 3 nodes
+      ansible.builtin.assert:
+        that:
+          - (az2_status.stdout | from_json).running_nodes | length == 3
+        fail_msg: "AZ-Cluster-2 should have 3 nodes, found {{ (az2_status.stdout | from_json).running_nodes | length }}"
+        success_msg: "AZ-Cluster-2 has 3 healthy nodes"
+
+- name: Check TX-Cluster-1
+  hosts: "{{ groups['tx-cluster-1'][0] }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Verify TX-Cluster-1 cluster size
+      ansible.builtin.command: rabbitmqctl cluster_status --formatter json
+      register: tx1_status
+      changed_when: false
+
+    - name: Assert TX-Cluster-1 has 3 nodes
+      ansible.builtin.assert:
+        that:
+          - (tx1_status.stdout | from_json).running_nodes | length == 3
+        fail_msg: "TX-Cluster-1 should have 3 nodes, found {{ (tx1_status.stdout | from_json).running_nodes | length }}"
+        success_msg: "TX-Cluster-1 has 3 healthy nodes"
+
+    - name: Check standby replication status
+      ansible.builtin.command: rabbitmqctl standby_replication_status
+      register: replication_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display replication status
+      ansible.builtin.debug:
+        msg: "{{ replication_status.stdout_lines | default(['Replication not configured']) }}"
+
+- name: Health Check Summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Print summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "Health Check Complete"
+          - "============================================"
+          - "AZ-Cluster-1: {{ groups['az-cluster-1'] | length }} nodes"
+          - "AZ-Cluster-2: {{ groups['az-cluster-2'] | length }} nodes"
+          - "TX-Cluster-1: {{ groups['tx-cluster-1'] | length }} nodes"
+          - "Warm Standby: AZ-Cluster-1 → AZ-Cluster-2, TX-Cluster-1"
+          - ""
+          - "All checks passed!"
+          - "============================================"

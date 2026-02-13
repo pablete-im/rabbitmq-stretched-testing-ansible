@@ -1,0 +1,28 @@
+# High Throughput Test
+# Multiple publishers pushing maximum throughput
+# Use this to find the ceiling of your cluster
+
+name: high-throughput
+description: "High throughput - 5 pubs, 5 cons, small messages"
+type: amqp
+
+# Test duration
+duration: 120
+
+# Publisher settings - multiple publishers for parallelism
+publishers: 5
+pub_rate: 0  # Unlimited
+
+# Consumer settings
+consumers: 5
+consumer_rate: 0  # Unlimited
+
+# Message settings - small messages for maximum rate
+message_size: 100  # 100 bytes
+confirm: true
+multi_ack_every: 200
+
+# Queue settings
+queue_type: quorum
+queue_args:
+  x-quorum-initial-group-size: 3

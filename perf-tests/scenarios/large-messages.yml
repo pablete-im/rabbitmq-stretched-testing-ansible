@@ -1,0 +1,28 @@
+# Large Message Test
+# Tests throughput with larger payloads
+# More representative of real-world document/event processing
+
+name: large-messages
+description: "Large messages - 64KB payloads"
+type: amqp
+
+# Test duration
+duration: 60
+
+# Publisher settings
+publishers: 2
+pub_rate: 1000  # Throttle to 1k msg/s due to size
+
+# Consumer settings
+consumers: 2
+consumer_rate: 0
+
+# Message settings - 64KB messages
+message_size: 65536
+confirm: true
+multi_ack_every: 50
+
+# Queue settings
+queue_type: quorum
+queue_args:
+  x-quorum-initial-group-size: 3

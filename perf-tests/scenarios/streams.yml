@@ -1,0 +1,24 @@
+# Stream Performance Test
+# Tests RabbitMQ Streams for high-throughput, log-style workloads
+# Streams are ideal for replay capabilities and high fan-out
+
+name: streams
+description: "Stream test - high throughput with replay capability"
+type: stream
+
+# Test duration
+duration: 60
+
+# Publisher settings
+publishers: 1
+pub_rate: 50000  # Target 50k msg/s
+
+# Consumer settings
+consumers: 3  # Multiple consumers to test fan-out
+
+# Message settings
+message_size: 1000  # 1KB
+
+# Stream settings
+stream: perf-test-stream
+offset: first  # Consumers start from beginning

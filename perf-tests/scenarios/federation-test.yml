@@ -1,0 +1,33 @@
+# Federation Replication Test
+# Tests message flow through federation (AZ-Cluster-1 -> TX-Cluster-1)
+# Run this to measure warm standby replication performance
+
+name: federation-test
+description: "Federation test - publish to AZ-Cluster-1, verify on TX-Cluster-1"
+type: amqp
+
+# Test duration
+duration: 120
+
+# Publisher settings - publish to AZ-Cluster-1
+publishers: 2
+pub_rate: 5000  # 5k msg/s to see federation lag
+
+# Consumer settings - consume from TX-Cluster-1 (federated)
+consumers: 2
+consumer_rate: 0
+
+# Message settings
+message_size: 1000
+confirm: true
+multi_ack_every: 100
+
+# Queue settings
+queue_type: quorum
+queue_args:
+  x-quorum-initial-group-size: 3
+
+# NOTE: This test requires manual setup:
+# 1. Run publisher against AZ-Cluster-1 (az-rmq-01, 192.168.20.200)
+# 2. Run consumer against TX-Cluster-1 (tx-rmq-01, 192.168.20.206)
+# 3. Queue must be federated (see configure_warm_standby.yml)

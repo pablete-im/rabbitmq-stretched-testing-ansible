@@ -1,0 +1,32 @@
+# Ansible
+*.retry
+*.log
+.vault_pass
+.vault_pass_txt
+
+# Secrets (not committed - use vault.yml.example as template)
+inventory/group_vars/all/vault.yml
+inventory/group_vars/all/vault-orginal.yml
+
+# Packer
+docs/packer/variables.pkrvars.hcl
+docs/packer/packer_cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Performance test results and tools (downloaded JARs)
+perf-tests/results/*.txt
+perf-tests/results/*.csv
+perf-tests/tools/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# BINARIES
+bin/

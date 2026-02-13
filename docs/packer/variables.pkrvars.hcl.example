@@ -1,0 +1,29 @@
+# =============================================================================
+# Packer Variables - Copy to variables.pkrvars.hcl and fill in your values
+# =============================================================================
+
+# vCenter connection
+vcenter_server   = "vcenter.example.com"
+vcenter_username = "administrator@vsphere.local"
+vcenter_password = "your-vcenter-password"
+
+# vCenter infrastructure
+vcenter_datacenter = "tanzu-datacenter"
+vcenter_cluster    = "tanzu-cluster"
+vcenter_datastore  = "vsanDatastore"
+vcenter_network    = "dvpg-mgmt-network"
+vcenter_folder     = "templates"  # Optional, leave empty if not using folders
+
+# RHEL ISO path (as seen from vCenter datastore browser)
+# Example: "[vsanDatastore] iso/rhel-9.6-x86_64-dvd.iso"
+iso_path = "[vsanDatastore] iso/rhel-9.6-x86_64-dvd.iso"
+
+# Red Hat subscription (for dnf updates during build)
+rh_username = "your-rh-username"
+rh_password = "your-rh-password"
+
+# Template settings
+template_name = "rhel9-6-template"
+vm_cpus       = 2
+vm_memory     = 4096
+vm_disk_size  = 40960

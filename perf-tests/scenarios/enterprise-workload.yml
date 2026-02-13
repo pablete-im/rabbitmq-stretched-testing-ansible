@@ -1,0 +1,27 @@
+# Enterprise Workload Test
+# Medium messages (5KB) at moderate rate (~3k msg/s target)
+# Reflects typical enterprise messaging patterns
+
+name: enterprise-workload
+description: "Enterprise workload - 5KB messages, moderate rate"
+type: amqp
+
+# Test duration (2 minutes for stable measurements)
+duration: 120
+
+# Publisher settings
+publishers: 2
+pub_rate: 1500  # 1500 msg/s per publisher = 3k total
+
+# Consumer settings
+consumers: 2
+consumer_rate: 0  # unlimited - consume as fast as possible
+
+# Message settings
+message_size: 5000  # 5KB - typical enterprise message payload
+confirm: true
+multi_ack_every: 50
+
+# Queue settings - quorum for durability
+queue_type: quorum
+queue: enterprise-workload-queue

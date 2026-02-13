@@ -1,0 +1,67 @@
+---
+# Uninstall Tanzu RabbitMQ and Revert Configuration
+#
+# Usage:
+#   ansible-playbook playbooks/uninstall.yml
+#
+- name: Uninstall RabbitMQ and Cleanup
+  hosts: nodes
+  become: true
+  tasks:
+    # 1. Stop Service
+    - name: Stop RabbitMQ Service
+      ansible.builtin.systemd:
+        name: tanzu-rabbitmq-server
+        state: stopped
+        enabled: no
+      ignore_errors: true
+
+    # 2. Remove Packages
+    - name: Remove RabbitMQ and Erlang
+      ansible.builtin.dnf:
+        name:
+          - tanzu-rabbitmq-server
+          - erlang
+        state: absent
+        autoremove: yes
+
+    # 3. Clean Directories
+    - name: Remove RabbitMQ data and config directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/rabbitmq
+        - /etc/rabbitmq
+        - /var/log/rabbitmq
+
+    # 4. Revert /etc/hosts changes (Optional - tough to do cleanly without regex, but we can try removing lines matching our hosts)
+    - name: Remove cluster nodes from /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "^{{ hostvars[item]['ansible_host'] }} {{ item }}"
+        state: absent
+      loop: "{{ groups['nodes'] }}"
+
+    # 5. Remove Latency Rules (tc)
+    - name: Clear existing network rules (Cleanup)
+      # We use async here because 'tc qdisc del' can cause a momentary reset of the link
+      # which often kills the very SSH connection Ansible is using.
+      ansible.builtin.shell: |
+        tc qdisc del dev {{ network.interface }} root 2>/dev/null || true
+        iptables -t mangle -F 2>/dev/null || true
+        # Re-apply SSH protection immediately after flush
+        iptables -t mangle -I OUTPUT -p tcp --sport 22 -j MARK --set-mark 10
+        iptables -t mangle -I OUTPUT -p tcp --dport 22 -j MARK --set-mark 10
+      async: 30
+      poll: 5
+      changed_when: false
+
+    - name: Uninstall iproute-tc (optional, maybe keep it?)
+      ansible.builtin.dnf:
+        name: iproute-tc
+        state: absent
+
+    - name: Cleanup complete
+      ansible.builtin.debug:
+        msg: "RabbitMQ uninstalled and configuration reverted on {{ inventory_hostname }}"

@@ -1,0 +1,27 @@
+# RabbitMQ Configuration File
+# Managed by Ansible
+
+# ============================================
+# Networking
+# ============================================
+listeners.tcp.default = 5672
+management.listener.port = 15672
+management.listener.ssl = false
+loopback_users.guest = false
+
+# ============================================
+# Stream Plugin
+# ============================================
+stream.advertised_host = {{ ansible_host }}
+stream.listeners.tcp.1 = 5552
+
+# ============================================
+# Clustering (Classic Config Peer Discovery)
+# ============================================
+cluster_formation.peer_discovery_backend = rabbit_peer_discovery_classic_config
+
+{% if rmq_cluster_name is defined %}
+{% for host in groups[rmq_cluster_name] %}
+cluster_formation.classic_config.nodes.{{ loop.index }} = rabbit@{{ host }}
+{% endfor %}
+{% endif %}

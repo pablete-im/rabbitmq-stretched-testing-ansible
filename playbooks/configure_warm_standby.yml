@@ -1,0 +1,420 @@
+---
+# Tanzu RabbitMQ Warm Standby Replication Configuration
+#
+# Fan-out topology from AZ-Cluster-1 (upstream):
+#   AZ-Cluster-1 → AZ-Cluster-2  (AZ region standby)
+#   AZ-Cluster-1 → TX-Cluster-1  (cross-region DR)
+#
+# Failover scenarios:
+#   AZ-Cluster-1 failure  → Promote AZ-Cluster-2
+#   Arizona region failure → Promote TX-Cluster-1
+#
+# Two subsystems work together:
+#   1. Schema Definition Sync   - replicates vhosts, users, queues, exchanges, policies (AMQP port 5672)
+#   2. Standby Message Replication - replicates messages via streams (stream port 5552)
+
+# ============================================
+# Phase 1: Enable required plugins on all nodes
+# ============================================
+- name: Enable warm standby plugins on all nodes
+  hosts: nodes
+  become: true
+  tasks:
+    - name: Enable management plugin
+      ansible.builtin.command: rabbitmq-plugins enable rabbitmq_management
+      register: result
+      changed_when: "'already enabled' not in result.stdout"
+
+    - name: Enable stream plugins
+      ansible.builtin.command: rabbitmq-plugins enable rabbitmq_stream rabbitmq_stream_management
+      register: result
+      changed_when: "'already enabled' not in result.stdout"
+
+    - name: Enable schema definition sync plugins
+      ansible.builtin.command: >
+        rabbitmq-plugins enable
+        rabbitmq_schema_definition_sync
+        rabbitmq_schema_definition_sync_prometheus
+      register: result
+      changed_when: "'already enabled' not in result.stdout"
+
+    - name: Enable standby replication plugin
+      ansible.builtin.command: rabbitmq-plugins enable rabbitmq_standby_replication
+      register: result
+      changed_when: "'already enabled' not in result.stdout"
+
+# ============================================
+# Phase 2: Create admin user on upstream BEFORE schema sync
+# ============================================
+# The admin user must exist before schema_definition_sync is activated.
+# Once schema sync is running, it continuously enforces the schema baseline
+# captured at startup. Users added after sync is active get wiped.
+- name: Create admin user on upstream
+  hosts: "{{ groups['az-cluster-1'][0] }}"
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Create admin user
+      ansible.builtin.command: >
+        rabbitmqctl add_user {{ rabbitmq.admin_user }} {{ rmq_password }}
+      register: result
+      changed_when: result.rc == 0
+      failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Set admin user tags
+      ansible.builtin.command: rabbitmqctl set_user_tags {{ rabbitmq.admin_user }} administrator
+      changed_when: true
+
+    - name: Set admin permissions
+      ansible.builtin.command: >
+        rabbitmqctl set_permissions -p / {{ rabbitmq.admin_user }} ".*" ".*" ".*"
+      changed_when: true
+
+# ============================================
+# Phase 3: Configure upstream cluster (AZ-Cluster-1) config and restart
+# ============================================
+- name: Configure upstream cluster (AZ-Cluster-1) config
+  hosts: az-cluster-1
+  become: true
+  serial: 1
+  tasks:
+    - name: Set schema_definition_sync operating mode to upstream
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.operating_mode = upstream"
+        regexp: '^schema_definition_sync\.operating_mode'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Set standby replication operating mode to upstream
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.operating_mode = upstream"
+        regexp: '^standby\.replication\.operating_mode'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Set standby replication retention size limit
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.retention.size_limit.messages = 5000000000"
+        regexp: '^standby\.replication\.retention\.size_limit\.messages'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Restart RabbitMQ to apply config
+      ansible.builtin.systemd:
+        name: tanzu-rabbitmq-server
+        state: restarted
+
+    - name: Wait for RabbitMQ to be ready
+      ansible.builtin.command: rabbitmqctl await_startup
+      timeout: 120
+      changed_when: false
+      retries: 5
+      delay: 10
+      register: result
+      until: result.rc == 0
+
+# ============================================
+# Phase 4: Configure upstream replication settings
+# ============================================
+- name: Configure upstream cluster replication
+  hosts: "{{ groups['az-cluster-1'][0] }}"
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+    upstream_endpoints_list:
+      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5672"
+      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5672"
+      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5672"
+  tasks:
+    - name: Create schema definition sync internal vhost
+      ansible.builtin.command: rabbitmqctl add_vhost rabbitmq_schema_definition_sync
+      register: result
+      changed_when: result.rc == 0
+      failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Create schema replication user
+      ansible.builtin.command: >
+        rabbitmqctl add_schema_replication_user
+        {{ rabbitmq.replication_user }} {{ rmq_password }}
+      register: result
+      changed_when: result.rc == 0
+      failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Set replication user permissions on default vhost
+      ansible.builtin.command: >
+        rabbitmqctl set_permissions -p / {{ rabbitmq.replication_user }} ".*" ".*" ".*"
+      changed_when: true
+
+    - name: Set schema replication upstream endpoints on upstream
+      ansible.builtin.command: >
+        rabbitmqctl set_schema_replication_upstream_endpoints 
+        '{{ {"endpoints": upstream_endpoints_list, "username": rabbitmq.replication_user, "password": rmq_password} | to_json }}'
+      changed_when: true
+
+    - name: Tag default vhost for standby replication
+      ansible.builtin.command: >
+        rabbitmqctl update_vhost_metadata / --tags "standby_replication"
+      changed_when: true
+
+    - name: Set replication policy for all queues
+      ansible.builtin.command: >
+        rabbitmqctl set_policy --vhost / standby-replication
+        "^.*" '{"remote-dc-replicate":true}' --apply-to queues
+      changed_when: true
+
+    - name: Verify upstream standby replication status
+      ansible.builtin.command: rabbitmqctl standby_replication_status
+      register: upstream_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display upstream status
+      ansible.builtin.debug:
+        msg: "{{ upstream_status.stdout_lines | default(['Status not available']) }}"
+
+# ============================================
+# Phase 5A: Write downstream config (all nodes, no restart yet)
+# ============================================
+- name: Write downstream cluster config
+  hosts: az-cluster-2:tx-cluster-1
+  become: true
+  tasks:
+    - name: Set schema_definition_sync operating mode to downstream
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.operating_mode = downstream"
+        regexp: '^schema_definition_sync\.operating_mode'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Set schema sync minimum interval
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.downstream.minimum_sync_interval = 30"
+        regexp: '^schema_definition_sync\.downstream\.minimum_sync_interval'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Preserve standby replication global parameters across sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.downstream.locals.global_parameters = ^standby"
+        regexp: '^schema_definition_sync\.downstream\.locals\.global_parameters'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Set standby replication operating mode to downstream
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.operating_mode = downstream"
+        regexp: '^standby\.replication\.operating_mode'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Set standby replication retention size limit
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.retention.size_limit.messages = 5000000000"
+        regexp: '^standby\.replication\.retention\.size_limit\.messages'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+# ============================================
+# Phase 5B: Set schema replication endpoints BEFORE restart
+# ============================================
+- name: Set schema replication endpoints on all downstreams (pre-restart)
+  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+    upstream_endpoints_list:
+      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5672"
+      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5672"
+      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5672"
+  tasks:
+    - name: Set schema replication upstream endpoints (AMQP port 5672)
+      ansible.builtin.shell: >
+        rabbitmqctl set_schema_replication_upstream_endpoints
+        '{{ {"endpoints": upstream_endpoints_list, "username": rabbitmq.replication_user, "password": rmq_password} | to_json }}'
+      changed_when: true
+
+    - name: Verify schema endpoints were stored
+      ansible.builtin.command: rabbitmqctl list_global_parameters
+      register: global_params
+      changed_when: false
+
+    - name: Display global parameters
+      ansible.builtin.debug:
+        var: global_params.stdout_lines
+
+# ============================================
+# Phase 5C: Restart downstream nodes (rolling)
+# ============================================
+- name: Restart downstream clusters
+  hosts: az-cluster-2:tx-cluster-1
+  become: true
+  serial: 1
+  tasks:
+    - name: Restart RabbitMQ to apply config
+      ansible.builtin.systemd:
+        name: tanzu-rabbitmq-server
+        state: restarted
+
+    - name: Wait for RabbitMQ to be ready
+      ansible.builtin.command: rabbitmqctl await_startup
+      timeout: 120
+      changed_when: false
+      retries: 5
+      delay: 10
+      register: result
+      until: result.rc == 0
+
+# ============================================
+# Phase 6: Connect standby replication and verify
+# ============================================
+- name: Connect all downstreams to upstream
+  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+    # Defined as a proper YAML list to ensure correct JSON encoding
+    upstream_stream_endpoints_list:
+      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5552"
+      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5552"
+      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5552"
+  tasks:
+    - name: Set standby replication upstream endpoints (stream port 5552)
+      ansible.builtin.shell: >
+        rabbitmqctl set_standby_replication_upstream_endpoints
+        '{{ {"endpoints": upstream_stream_endpoints_list, "username": rabbitmq.replication_user, "password": rmq_password} | to_json }}'
+      register: standby_result
+      changed_when: true
+
+    - name: Show standby replication result
+      ansible.builtin.debug:
+        var: standby_result
+
+    - name: Connect standby replication downstream
+      ansible.builtin.command: rabbitmqctl connect_standby_replication_downstream
+      register: connect_result
+      changed_when: true
+
+    - name: Show connect result
+      ansible.builtin.debug:
+        var: connect_result
+
+    - name: Wait for schema replication to connect
+      ansible.builtin.command: rabbitmqctl schema_replication_status
+      register: verify_result
+      changed_when: false
+      retries: 12
+      delay: 10
+      until: >
+        'running' in verify_result.stdout or
+        'syncing' in verify_result.stdout
+
+    - name: Show schema replication status
+      ansible.builtin.debug:
+        var: verify_result.stdout_lines
+
+# ============================================
+# Phase 7: Verify replication status
+# ============================================
+- name: Verify all downstream replication
+  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  become: true
+  tasks:
+    - name: Check standby replication status
+      ansible.builtin.command: rabbitmqctl standby_replication_status
+      register: replication_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display standby replication status
+      ansible.builtin.debug:
+        msg: "{{ replication_status.stdout_lines | default(['Status not available']) }}"
+
+    - name: Check schema replication status
+      ansible.builtin.command: rabbitmqctl schema_replication_status
+      register: schema_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display schema replication status
+      ansible.builtin.debug:
+        msg: "{{ schema_status.stdout_lines | default(['Status not available']) }}"
+
+    - name: List vhosts available for recovery
+      ansible.builtin.command: rabbitmqctl list_vhosts_available_for_standby_replication_recovery
+      register: recovery_vhosts
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display vhosts available for recovery
+      ansible.builtin.debug:
+        msg: "{{ recovery_vhosts.stdout_lines | default(['None available']) }}"
+
+# ============================================
+# Phase 8: Display summary
+# ============================================
+- name: Display Summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Print configuration summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "Warm Standby Replication Configuration Complete"
+          - "============================================"
+          - ""
+          - "Topology (fan-out from AZ-Cluster-1):"
+          - "  AZ-Cluster-1 (upstream) → AZ-Cluster-2 (AZ region standby)"
+          - "  AZ-Cluster-1 (upstream) → TX-Cluster-1 (cross-region DR)"
+          - ""
+          - "What is replicated:"
+          - "  Schema:   vhosts, users, queues, exchanges, policies (via schema_definition_sync)"
+          - "  Messages: queue contents (via standby_replication, stream port 5552)"
+          - ""
+          - "Upstream Cluster:"
+          - "  AZ-Cluster-1: {{ groups['az-cluster-1'] | join(', ') }}"
+          - ""
+          - "Downstream Clusters:"
+          - "  AZ-Cluster-2: {{ groups['az-cluster-2'] | join(', ') }}"
+          - "  TX-Cluster-1: {{ groups['tx-cluster-1'] | join(', ') }}"
+          - ""
+          - "Failover:"
+          - "  AZ-Cluster-1 failure  → Promote AZ-Cluster-2"
+          - "  Arizona region failure → Promote TX-Cluster-1"
+          - "  Command: rabbitmqctl promote_warm_standby"
+          - ""
+          - "Management UIs:"
+          - "  AZ-Cluster-1: http://{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:{{ rabbitmq.management_port }}"
+          - "  AZ-Cluster-2: http://{{ hostvars[groups['az-cluster-2'][0]]['ansible_host'] }}:{{ rabbitmq.management_port }}"
+          - "  TX-Cluster-1: http://{{ hostvars[groups['tx-cluster-1'][0]]['ansible_host'] }}:{{ rabbitmq.management_port }}"
+          - ""
+          - "Verify replication:"
+          - "  rabbitmqctl standby_replication_status"
+          - "  rabbitmqctl schema_replication_status"
+          - "  rabbitmqctl list_vhosts_available_for_standby_replication_recovery"
+          - "============================================"

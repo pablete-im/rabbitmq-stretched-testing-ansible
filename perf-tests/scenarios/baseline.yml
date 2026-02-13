@@ -1,0 +1,28 @@
+# Baseline Performance Test
+# Single publisher, single consumer, small messages
+# Use this to establish baseline performance metrics
+
+name: baseline
+description: "Baseline test - 1 pub, 1 con, 1KB messages"
+type: amqp
+
+# Test duration
+duration: 60
+
+# Publisher settings
+publishers: 1
+pub_rate: 0  # 0 = unlimited
+
+# Consumer settings
+consumers: 1
+consumer_rate: 0  # 0 = unlimited
+
+# Message settings
+message_size: 1000  # 1KB
+confirm: true
+multi_ack_every: 100
+
+# Queue settings
+queue_type: quorum  # classic, quorum, or stream
+queue_args:
+  x-quorum-initial-group-size: 3

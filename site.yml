@@ -1,0 +1,27 @@
+---
+# Master playbook - runs all playbooks in correct order
+#
+# Usage:
+#   Full deployment:     ansible-playbook site.yml
+#   Skip VM provisioning: ansible-playbook site.yml --skip-tags provision
+#   Only clustering:     ansible-playbook site.yml --tags cluster
+#
+# - name: Provision VMs
+#   ansible.builtin.import_playbook: playbooks/provision.yml
+#   tags: [provision, infra]
+
+- name: Install Tanzu RabbitMQ
+  ansible.builtin.import_playbook: playbooks/install_rmq.yml
+  tags: [install, rmq]
+
+# - name: Form RabbitMQ Clusters
+#   ansible.builtin.import_playbook: playbooks/cluster_rmq.yml
+#   tags: [cluster, rmq]
+
+- name: Configure Network Latency Simulation
+  ansible.builtin.import_playbook: playbooks/configure_latency.yml
+  tags: [latency, network]
+
+- name: Configure Warm Standby Replication
+  ansible.builtin.import_playbook: playbooks/configure_warm_standby.yml
+  tags: [standby, federation, rmq]

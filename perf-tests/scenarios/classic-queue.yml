@@ -1,0 +1,28 @@
+# Classic Queue Test
+# Baseline comparison using classic (non-replicated) queues
+# Compare results with quorum queue tests to see replication overhead
+
+name: classic-queue
+description: "Classic queue - non-replicated baseline comparison"
+type: amqp
+
+# Test duration
+duration: 60
+
+# Publisher settings
+publishers: 1
+pub_rate: 0
+
+# Consumer settings
+consumers: 1
+consumer_rate: 0
+
+# Message settings
+message_size: 1000
+confirm: true
+multi_ack_every: 100
+
+# Queue settings - classic (non-replicated) queue
+queue_type: classic
+queue_args:
+  x-queue-type: classic

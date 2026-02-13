@@ -1,0 +1,59 @@
+---
+# Destroy all lab VMs
+#
+# Usage:
+#   ansible-playbook playbooks/destroy.yml
+#
+# Add --check for dry-run to see what would be deleted
+#
+- name: Destroy Tanzu RMQ Lab VMs
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    confirm_destroy: false
+  tasks:
+    - name: Confirm destruction
+      ansible.builtin.pause:
+        prompt: |
+
+          WARNING: This will delete ALL lab VMs:
+            {{ groups['nodes'] | join(', ') }}
+
+          Type 'yes' to confirm
+      register: confirm
+      when: not confirm_destroy
+
+    - name: Abort if not confirmed
+      ansible.builtin.fail:
+        msg: "Destruction cancelled"
+      when:
+        - not confirm_destroy
+        - confirm.user_input != 'yes'
+
+    - name: Power off VMs
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_user }}"
+        password: "{{ vcenter_pass }}"
+        validate_certs: false
+        datacenter: "{{ vsphere.datacenter }}"
+        name: "{{ item }}"
+        state: poweredoff
+      loop: "{{ groups['nodes'] }}"
+      ignore_errors: true
+
+    - name: Delete VMs
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_host }}"
+        username: "{{ vcenter_user }}"
+        password: "{{ vcenter_pass }}"
+        validate_certs: false
+        datacenter: "{{ vsphere.datacenter }}"
+        name: "{{ item }}"
+        state: absent
+      loop: "{{ groups['nodes'] }}"
+
+    - name: Destruction complete
+      ansible.builtin.debug:
+        msg: "All lab VMs have been deleted"

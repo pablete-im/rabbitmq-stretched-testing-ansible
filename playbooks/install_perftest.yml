@@ -1,0 +1,84 @@
+---
+# Install RabbitMQ Performance Testing Tools
+#
+# Installs both perf-test (AMQP) and stream-perf-test on a control node
+# Run from: ansible-playbook playbooks/install_perftest.yml
+#
+- name: Install RabbitMQ Performance Test Tools
+  hosts: "{{ perf_host | default('localhost') }}"
+  become: "{{ 'no' if perf_host is not defined or perf_host == 'localhost' else 'yes' }}"
+  vars:
+    perf_test_version: "2.24.0"
+    stream_perf_test_version: "1.6.0"
+    install_dir: "{{ perf_install_dir | default(playbook_dir + '/../perf-tests/tools') }}"
+  tasks:
+    - name: Ensure Java is installed
+      ansible.builtin.package:
+        name: java-17-openjdk
+        state: present
+      when: perf_host is defined and perf_host != 'localhost'
+
+    - name: Check for Java (localhost)
+      ansible.builtin.command: java -version
+      register: java_check
+      changed_when: false
+      failed_when: false
+      when: perf_host is not defined or perf_host == 'localhost'
+
+    - name: Warn if Java not found on localhost
+      ansible.builtin.debug:
+        msg: |
+          WARNING: Java not found. Please install Java 11+ to run perf tests.
+          macOS: brew install openjdk@17
+          Linux: sudo dnf install java-17-openjdk
+      when:
+        - perf_host is not defined or perf_host == 'localhost'
+        - java_check.rc != 0
+
+    - name: Create install directory
+      ansible.builtin.file:
+        path: "{{ install_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Download RabbitMQ PerfTest
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/rabbitmq-perf-test/releases/download/v{{ perf_test_version }}/perf-test-{{ perf_test_version }}.jar"
+        dest: "{{ install_dir }}/perf-test.jar"
+        mode: '0644'
+
+    - name: Download RabbitMQ Stream PerfTest
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/rabbitmq-stream-perf-test/releases/download/v{{ stream_perf_test_version }}/stream-perf-test-{{ stream_perf_test_version }}.jar"
+        dest: "{{ install_dir }}/stream-perf-test.jar"
+        mode: '0644'
+
+    - name: Create perf-test wrapper script
+      ansible.builtin.copy:
+        dest: "{{ install_dir }}/perf-test"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          exec java -jar "$SCRIPT_DIR/perf-test.jar" "$@"
+
+    - name: Create stream-perf-test wrapper script
+      ansible.builtin.copy:
+        dest: "{{ install_dir }}/stream-perf-test"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          exec java -jar "$SCRIPT_DIR/stream-perf-test.jar" "$@"
+
+    - name: Installation complete
+      ansible.builtin.debug:
+        msg:
+          - "Performance test tools installed to: {{ install_dir }}"
+          - ""
+          - "Usage:"
+          - "  {{ install_dir }}/perf-test --help"
+          - "  {{ install_dir }}/stream-perf-test --help"
+          - ""
+          - "Quick test:"
+          - "  {{ install_dir }}/perf-test -x 1 -y 1 -u queue-test -a -h {{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}"

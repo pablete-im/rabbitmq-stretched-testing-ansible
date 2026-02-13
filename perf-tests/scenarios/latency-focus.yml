@@ -1,0 +1,28 @@
+# Latency-Focused Test
+# Lower throughput to measure end-to-end latency accurately
+# Use with --metrics-prometheus-* flags for detailed latency percentiles
+
+name: latency-focus
+description: "Latency test - moderate rate for accurate latency measurement"
+type: amqp
+
+# Test duration
+duration: 120
+
+# Publisher settings - controlled rate for stable latency measurement
+publishers: 1
+pub_rate: 1000  # 1000 msg/s - enough load without saturation
+
+# Consumer settings
+consumers: 1
+consumer_rate: 0
+
+# Message settings
+message_size: 1000
+confirm: true
+multi_ack_every: 1  # Ack every message for accurate latency
+
+# Queue settings
+queue_type: quorum
+queue_args:
+  x-quorum-initial-group-size: 3

@@ -1,0 +1,172 @@
+---
+# ============================================
+# Install Tanzu RabbitMQ
+# ============================================
+- name: Install Tanzu RabbitMQ
+  hosts: nodes
+  become: true
+  vars:
+    # Variables for versions
+    erlang_version: "erlang-27.3.4.6-1.el9"
+    # Note: RPM path is relative to playbook/ directory
+    rmq_rpm_filename: "tanzu-rabbitmq-server-4.2.3-1.el9.x86_64.rpm"
+    rmq_local_path: "../bin/{{ rmq_rpm_filename }}"
+    
+    # Broadcom download URL (if local file missing)
+    # Using specific version URL pattern
+    broadcom_download_url: "https://packages.broadcom.com/artifactory/rabbitmq-rpm/{{ rmq_rpm_filename }}"
+    #broadcom_download_url: "packages.broadcom.com/artifactory/rabbitmq-rpm/{{ rmq_rpm_filename }}"
+    
+    erlang_cookie: "TANZURMQANSIBLELABCOOKIE123" # Should be in vault for prod
+
+  tasks:
+    # 0. Check for local RPM on controller
+    - name: Check if local RPM exists on controller
+      ansible.builtin.stat:
+        path: "{{ rmq_local_path }}"
+      register: local_rpm_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Download RPM from Broadcom if missing locally
+      when: not local_rpm_stat.stat.exists
+      delegate_to: localhost
+      become: false
+      run_once: true
+      block:
+        - name: Ensure bin directory exists
+          ansible.builtin.file:
+            path: "../bin"
+            state: directory
+            mode: '0755'
+        - name: Download Tanzu RabbitMQ RPM (via Curl)
+          ansible.builtin.shell: >
+            curl -f -L -u "{{ broadcom_user }}:{{ broadcom_token }}" --create-dirs "{{ broadcom_download_url }}" -o "{{ rmq_local_path }}"
+          args:
+            creates: "{{ rmq_local_path }}"
+          register: curl_download
+          until: curl_download.rc == 0
+          retries: 2
+          delay: 5
+
+      rescue:
+        - name: Fail if download fails
+          ansible.builtin.fail:
+            msg: >
+              Local RPM not found at {{ rmq_local_path }} AND download from Broadcom failed.
+              Please ensure 'broadcom_user' and 'broadcom_token' are set in vault.yml,
+              or manually place the RPM in the bin/ directory.
+
+    # 1. Host Resolution (Critical for clustering via config)
+    - name: Add all cluster nodes to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ANSIBLE MANAGED NODES"
+        block: |
+          {% for node in groups['nodes'] %}
+          {{ hostvars[node]['ansible_host'] }} {{ node }}
+          {% endfor %}
+        state: present
+
+    # 2. System Prep
+    - name: Disable firewalld for lab
+      ansible.builtin.systemd:
+        name: firewalld
+        state: stopped
+        enabled: no
+
+    # 3. Install Erlang
+    - name: Cleanup and Setup Erlang Repository and install Erlang
+      block:
+        - name: Force remove ANY broken rabbitmq repo file
+          # Usamos un comando de shell para limpiar archivos que puedan tener nombres distintos
+          ansible.builtin.shell: "rm -f /etc/yum.repos.d/rabbitmq*"
+          changed_when: true
+
+        - name: Clean DNF metadata cache manually
+          # Esto evita que DNF intente buscar en URLs que ya no existen
+          ansible.builtin.command: dnf clean all
+          changed_when: true
+
+        - name: Import Cloudsmith Erlang GPG Key
+          ansible.builtin.rpm_key:
+            state: present
+            key: "https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-erlang.E495BB49CC4BBE5B.key"
+
+        - name: Add RabbitMQ Erlang Repository
+          ansible.builtin.yum_repository:
+            name: "rabbitmq-erlang"
+            description: RabbitMQ Erlang Repo
+            baseurl: https://yum1.rabbitmq.com/erlang/el/9/$basearch
+            enabled: yes
+            gpgcheck: yes
+            gpgkey: https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-erlang.E495BB49CC4BBE5B.key
+
+        - name: Install Erlang and dependencies
+          ansible.builtin.dnf:
+            name: 
+              - curl
+              - ca-certificates
+              - "{{ erlang_version }}"
+            state: present
+            update_cache: yes
+     
+    # 4. Install RabbitMQ from local RPM (now guaranteed to exist on controller)
+    - name: Copy RabbitMQ RPM to remote
+      ansible.builtin.copy:
+        src: "{{ rmq_local_path }}"
+        dest: /tmp/rabbitmq-server.rpm
+
+    - name: Install RabbitMQ Server
+      ansible.builtin.dnf:
+        name: /tmp/rabbitmq-server.rpm
+        state: present
+        disable_gpg_check: yes
+
+    # 5. Configure Erlang Cookie (BEFORE starting)
+    - name: Set Erlang Cookie
+      ansible.builtin.copy:
+        content: "{{ erlang_cookie }}"
+        dest: /var/lib/rabbitmq/.erlang.cookie
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0400'
+
+    # 6. Configure RabbitMQ
+    - name: Force RabbitMQ to use the inventory short name
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq-env.conf
+        line: "NODENAME=rabbit@{{ inventory_hostname }}"
+        create: yes
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+    - name: Deploy rabbitmq.conf
+      ansible.builtin.template:
+        src: ../templates/rabbitmq.conf.j2
+        dest: /etc/rabbitmq/rabbitmq.conf
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+    
+    # 7. Enable Plugins
+    - name: Enable Management Plugin
+      ansible.builtin.command: rabbitmq-plugins enable rabbitmq_management
+      changed_when: false # It handles idempotency well enough usually
+
+    # 8. Start Service
+    - name: Enable and Start RabbitMQ Service
+      ansible.builtin.systemd:
+        name: tanzu-rabbitmq-server # Service name for Tanzu package
+        state: restarted # Restart to apply config and cookie
+        enabled: yes
+
+    - name: Check RabbitMQ Status
+      ansible.builtin.command: rabbitmqctl status
+      register: rmq_status
+      changed_when: false
+
+    - name: Print Status
+      ansible.builtin.debug:
+        var: rmq_status.stdout_lines[0]
