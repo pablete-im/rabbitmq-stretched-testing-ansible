@@ -18,6 +18,8 @@
     #broadcom_download_url: "packages.broadcom.com/artifactory/rabbitmq-rpm/{{ rmq_rpm_filename }}"
     
     erlang_cookie: "TANZURMQANSIBLELABCOOKIE123" # Should be in vault for prod
+    stream_metadata_dir: "/app/rabbitmq_stream_metadata"
+    metadata_dir: "/app/rabbitmq_metadata"
 
   tasks:
     # 0. Check for local RPM on controller
@@ -134,11 +136,28 @@
         mode: '0400'
 
     # 6. Configure RabbitMQ
-    - name: Force RabbitMQ to use the inventory short name
-      ansible.builtin.lineinfile:
-        path: /etc/rabbitmq/rabbitmq-env.conf
-        line: "NODENAME=rabbit@{{ inventory_hostname }}"
-        create: yes
+    - name: Ensure the stream metadata dir custom directory exists
+      ansible.builtin.file:
+        path: "{{ stream_metadata_dir }}"
+        state: directory
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0755'
+        recurse: yes
+      when: stream_metadata_dir is defined
+    - name: Ensure the metadata dir custom directory exists
+      ansible.builtin.file:
+        path: "{{ metadata_dir }}"
+        state: directory
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0755'
+        recurse: yes
+      when: metadata_dir is defined
+    - name: Deploy rabbitmq-env.conf
+      ansible.builtin.template:
+        src: ../templates/rabbitmq-env.conf.j2
+        dest: /etc/rabbitmq/rabbitmq-env.conf
         owner: rabbitmq
         group: rabbitmq
         mode: '0644'

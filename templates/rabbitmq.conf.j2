@@ -14,6 +14,9 @@ loopback_users.guest = false
 # ============================================
 stream.advertised_host = {{ ansible_host }}
 stream.listeners.tcp.1 = 5552
+{% if stream_metadata_dir is defined %}
+stream.data_dir = {{ stream_metadata_dir }}
+{% endif %}
 
 # ============================================
 # Clustering (Classic Config Peer Discovery)
