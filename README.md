@@ -5,6 +5,7 @@ Automated deployment of a Tanzu RabbitMQ multi-region lab environment using **ex
 - **3 Clusters** across 2 regions (Arizona + Texas):
   - **Arizona:** 2 Clusters (az-cluster-1, az-cluster-2), each with 3 nodes (1 per AZ)
   - **Texas:** 1 Cluster (tx-cluster-1), with 3 nodes (1 per AZ)
+- **TLS 1.2 Security**: End-to-end encryption for client connections and inter-node communication
 - **Network Latency Simulation**: Metro (~3ms) within regions, cross-region (~35ms) between Arizona and Texas
 - **Warm Standby DR**: AZ-Cluster-1 replicates to AZ-Cluster-2 (regional standby) and TX-Cluster-1 (cross-region DR)
 - **9 Nodes Total**: 6 in Arizona, 3 in Texas
@@ -60,10 +61,14 @@ flowchart LR
   - Python 3.9+ with Ansible
   - Access to nodes via SSH (key-based auth recommended)
   - RabbitMQ RPM in `bin/` directory (`tanzu-rabbitmq-server-4.2.3-1.el9.x86_64.rpm`)
+  - **TLS PKI**: Complete certificate infrastructure in `pki/` directory:
+    - `ca.crt` and `ca.key` (Root CA)
+    - `{hostname}_rabbitcert.crt` and `{hostname}_rabbitcert.key` for each node
 - **Remote Nodes:**
   - RHEL/Rocky Linux 9.7
   - SSH access for Ansible user (e.g., `root`)
   - Internet access (or configured repos) for dependencies (`dnf install erlang`, `iproute-tc`)
+  - OpenSSL for certificate operations
 
 ## Quick Start
 
@@ -92,11 +97,31 @@ Edit `inventory/hosts.yml` to set your **real IP addresses**:
           ansible_host: 10.85.10.234 
 ```
 
-### 4. Deploy
+### 4. Prepare TLS Certificates
+
+Ensure your PKI structure is in place in the `pki/` directory:
+
+```
+pki/
+├── ca.crt                              # Root CA certificate
+├── pve-schwab-rmq01_rabbitcert.crt     # Host certificates
+├── pve-schwab-rmq01_rabbitcert.key     # Host private keys
+├── pve-schwab-rmq02_rabbitcert.crt
+├── pve-schwab-rmq02_rabbitcert.key
+└── ... (for all 9 nodes)
+```
+
+### 5. Deploy
 
 ```bash
 ansible-playbook site.yml
 ```
+
+This will:
+1. Configure TLS certificates and prepare security infrastructure
+2. Install Erlang and RabbitMQ with TLS support
+3. Configure network latency simulation
+4. Set up warm standby replication over TLS
 
 ## Playbooks
 
@@ -104,8 +129,11 @@ ansible-playbook site.yml
 |----------|-------------|
 | `site.yml` | Master playbook - runs installation and configuration |
 | `playbooks/install_rmq.yml` | Installs Erlang and RabbitMQ from local RPM |
+| `playbooks/configure_tls.yml` | **NEW** - Configure TLS 1.2 certificates and security |
 | `playbooks/configure_latency.yml` | Setup network latency simulation (Metro/Cross-Region) |
-| `playbooks/configure_warm_standby.yml` | Configure warm standby replication DR |
+| `playbooks/configure_warm_standby.yml` | Configure warm standby replication DR over TLS |
+| `playbooks/verify_tls.yml` | **NEW** - Verify TLS configuration and connectivity |
+| `playbooks/verify_warm_standby_tls.yml` | **NEW** - Test warm standby replication over TLS |
 | `playbooks/uninstall.yml` | **Uninstall** RabbitMQ and revert configuration |
 | `playbooks/health_check.yml` | Verify cluster health |
 
@@ -119,21 +147,58 @@ ansible-playbook playbooks/uninstall.yml
 
 ## Management UIs
 
-After deployment, access the Management UI on port 15672:
+After deployment, access the Management UI:
 
-| Cluster | URL (Example IP) | Credentials |
-|---------|-----|-------------|
-| AZ-Cluster-1 | http://10.85.10.234:15672 | admin / (check vault or default) |
-| AZ-Cluster-2 | http://110.85.10.241:15672 | admin / (check vault or default) |
-| TX-Cluster-1 | http://10.85.10.244:15672 | admin / (check vault or default) |
+| Cluster | HTTP (Legacy) | HTTPS (TLS) | Credentials |
+|---------|---------------|-------------|-------------|
+| AZ-Cluster-1 | http://10.85.10.234:15672 | **https://10.85.10.234:15671** | admin / (check vault or default) |
+| AZ-Cluster-2 | http://10.85.10.241:15672 | **https://10.85.10.241:15671** | admin / (check vault or default) |
+| TX-Cluster-1 | http://10.85.10.244:15672 | **https://10.85.10.244:15671** | admin / (check vault or default) |
+
+**Note**: TLS-enabled HTTPS management interface is available on port 15671 with proper certificate validation.
+
+## TLS Configuration
+
+### Ports and Protocols
+
+| Service | Non-TLS Port | TLS Port | Protocol |
+|---------|-------------|----------|----------|
+| AMQP | 5672 | **5671** | TLS 1.2/1.3 |
+| Management UI | 15672 | **15671** | HTTPS TLS 1.2/1.3 |
+| Stream | 5552 | **5551** | TLS 1.2/1.3 |
+| Inter-node | 25672 | **25672** | TLS 1.2/1.3 (Erlang Distribution) |
+
+### Client Connection Examples
+
+```bash
+# AMQP TLS connection
+amqps://username:password@10.85.10.234:5671/
+
+# Management API over HTTPS
+curl -k -u admin:password https://10.85.10.234:15671/api/overview
+
+# Verify TLS configuration
+ansible-playbook playbooks/verify_tls.yml
+```
 
 ## Testing Warm Standby Replication
 
-1. Log into AZ-Cluster-1 management UI
+### Automated TLS Testing
+```bash
+# Test complete warm standby replication over TLS
+ansible-playbook playbooks/verify_warm_standby_tls.yml
+```
+
+### Manual Testing
+1. Log into AZ-Cluster-1 management UI (HTTPS): `https://10.85.10.234:15671`
 2. Create a queue and publish messages
-3. Log into AZ-Cluster-2 or TX-Cluster-1
+3. Log into AZ-Cluster-2 or TX-Cluster-1 management UI
 4. Verify the queue and messages appear via warm standby replication
 5. Check replication status: `rabbitmqctl standby_replication_status`
+
+**Note**: All replication traffic now uses TLS encryption:
+- Schema replication: AMQP TLS port 5671
+- Message replication: Stream TLS port 5551
 
 ## Troubleshooting
 
@@ -144,30 +209,156 @@ ansible-playbook playbooks/health_check.yml
 
 ### Manual cluster status
 ```bash
-ansible az-rmq-01 -m command -a "rabbitmqctl cluster_status"
-ansible az-rmq-04 -m command -a "rabbitmqctl cluster_status"
-ansible tx-rmq-01 -m command -a "rabbitmqctl cluster_status"
+ansible az-rmq-01 -m command -a "rabbitmqctl cluster_status" -b
+ansible az-rmq-04 -m command -a "rabbitmqctl cluster_status" -b
+ansible tx-rmq-01 -m command -a "rabbitmqctl cluster_status" -b
 ```
 
 ### Verify latency simulation
 ```bash
 # Metro latency within Arizona (~3ms)
-ansible az-rmq-01 -m command -a "ping -c 3 az-rmq-02"
+ansible az-rmq-01 -m command -a "ping -c 3 az-rmq-02" -b
 
 # Cross-region latency Arizona → Texas (~35ms)
-ansible az-rmq-01 -m command -a "ping -c 3 tx-rmq-01"
+ansible az-rmq-01 -m command -a "ping -c 3 tx-rmq-01" -b
 ```
 
 ### Reset admin password
 ```bash
 # Reset on all cluster seeds
-ansible az-rmq-01,az-rmq-04,tx-rmq-01 -m command -a "rabbitmqctl change_password admin newpassword"
+ansible az-rmq-01,az-rmq-04,tx-rmq-01 -m command -a "rabbitmqctl change_password admin newpassword" -b
 ```
 
 ### Re-run specific stage
 ```bash
 # Re-configure federation
 ansible-playbook playbooks/configure_warm_standby.yml
+```
+
+### Schema Replication Issues
+
+If schema replication is stuck in `connecting` or `recover` state:
+
+#### Quick Diagnosis
+
+Run the diagnostic playbook:
+```bash
+ansible-playbook playbooks/diagnose_schema_replication.yml
+```
+
+Or run the diagnostic script directly on a downstream node:
+```bash
+# Copy script to downstream node
+ansible az-cluster-2:tx-cluster-1 -m copy \
+  -a "src=scripts/diagnose_schema_replication.sh dest=/tmp/diagnose.sh mode=0755" -b
+
+# Execute it
+ansible az-cluster-2:tx-cluster-1 -m shell -a "/tmp/diagnose.sh" -b
+```
+
+#### Common Issues and Fixes
+
+**1. State: `connecting` (Cannot reach upstream)**
+
+Causes:
+- Network connectivity issues
+- TLS certificate verification failing
+- Firewall blocking port 5671
+
+Fix:
+```bash
+# Test TLS connectivity manually on downstream node (1-way TLS)
+echo | openssl s_client -connect <upstream-ip>:5671 \
+  -CAfile /etc/rabbitmq/tls/ca.crt
+
+# Expected: "Verify return code: 0 (ok)"
+# If error 18: Certificate verification failed
+# If error 20: Unable to verify issuer
+```
+
+**2. State: `recover` (Authentication failing)**
+
+Causes:
+- Replication user doesn't exist on upstream
+- Wrong password in endpoints configuration
+- Missing permissions for replication user
+
+Fix - run the fix playbook:
+```bash
+ansible-playbook playbooks/fix_schema_replication.yml
+```
+
+Or manually on upstream first node:
+```bash
+# Recreate replication user
+rabbitmqctl delete_user replication
+rabbitmqctl add_schema_replication_user replication <password>
+rabbitmqctl set_permissions -p / replication ".*" ".*" ".*"
+rabbitmqctl set_permissions -p rabbitmq_schema_definition_sync replication ".*" ".*" ".*"
+```
+
+**3. TLS Certificate Issues**
+
+Fix certificate permissions:
+```bash
+# On all nodes (only server certificates needed)
+chown -R rabbitmq:rabbitmq /etc/rabbitmq/tls/
+chmod 750 /etc/rabbitmq/tls/
+chmod 644 /etc/rabbitmq/tls/ca.crt
+chmod 644 /etc/rabbitmq/tls/server.crt
+chmod 600 /etc/rabbitmq/tls/server.key
+
+# Restart RabbitMQ
+systemctl restart tanzu-rabbitmq-server
+```
+
+**4. Reset Schema Replication**
+
+If all else fails, reset schema replication on downstream:
+```bash
+# On downstream first node (az-rmq-04 or tx-rmq-01)
+rabbitmqctl stop_schema_replication
+rabbitmqctl clear_global_parameter schema_definition_sync_upstream_endpoints
+
+# Set endpoints again with correct password
+rabbitmqctl set_schema_replication_upstream_endpoints \
+  '{"endpoints": ["10.85.10.234:5671", "10.85.10.235:5671", "10.85.10.236:5671"], "username": "replication", "password": "YOUR_PASSWORD_HERE"}'
+
+# Restart RabbitMQ
+systemctl restart tanzu-rabbitmq-server
+
+# Wait and check status
+sleep 30
+rabbitmqctl schema_replication_status
+```
+
+#### Verification Commands
+
+Check status on downstream:
+```bash
+# Schema replication status
+rabbitmqctl schema_replication_status
+
+# Expected output when working:
+# State: running  (or syncing)
+
+# Check configured endpoints
+rabbitmqctl list_global_parameters
+
+# Check standby replication
+rabbitmqctl standby_replication_status
+```
+
+Check on upstream:
+```bash
+# List replication user
+rabbitmqctl list_users | grep replication
+
+# Check user permissions
+rabbitmqctl list_user_permissions replication
+
+# Check schema sync status
+rabbitmqctl schema_replication_status
 ```
 
 ## Performance Testing

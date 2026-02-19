@@ -14,7 +14,7 @@
   tasks:
     - name: Ensure Java is installed
       ansible.builtin.package:
-        name: java-17-openjdk
+        name: java-21-openjdk
         state: present
       when: perf_host is defined and perf_host != 'localhost'
 
@@ -46,12 +46,14 @@
         url: "https://github.com/rabbitmq/rabbitmq-perf-test/releases/download/v{{ perf_test_version }}/perf-test-{{ perf_test_version }}.jar"
         dest: "{{ install_dir }}/perf-test.jar"
         mode: '0644'
+        validate_certs: no
 
     - name: Download RabbitMQ Stream PerfTest
       ansible.builtin.get_url:
         url: "https://github.com/rabbitmq/rabbitmq-stream-perf-test/releases/download/v{{ stream_perf_test_version }}/stream-perf-test-{{ stream_perf_test_version }}.jar"
         dest: "{{ install_dir }}/stream-perf-test.jar"
         mode: '0644'
+        validate_certs: no
 
     - name: Create perf-test wrapper script
       ansible.builtin.copy:

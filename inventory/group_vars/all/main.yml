@@ -2,21 +2,6 @@
 # Non-secret variables for the lab environment
 
 # ===========================================
-# vSphere Infrastructure
-# ===========================================
-vsphere:
-  datacenter: "tanzu-datacenter"
-  cluster: "tanzu-cluster"
-  datastore: "vsanDatastore"
-  folder: "rabbitmq-lab"
-  template: "rhel9-6-template"
-  network: "dvpg-mgmt-network"
-
-# SSH public key for passwordless access to provisioned nodes (optional)
-# Uncomment and set to inject your key during VM provisioning via cloud-init
-ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFhHuNyP6iMEsJiJm8v1cgYs1rXdDrSdGQZn2utFJysM shepherdkey"
-
-# ===========================================
 # Network Configuration
 # ===========================================
 network:
@@ -38,13 +23,6 @@ latency:
     delay_ms: 15
     jitter_ms: 2
 
-# ===========================================
-# VM Hardware
-# ===========================================
-vm:
-  cpu: 2
-  memory_mb: 16384
-  disk_gb: 100
 
 # ===========================================
 # RabbitMQ Configuration
@@ -56,3 +34,5 @@ rabbitmq:
   management_port: 15672
   clustering_port: 25672
   epmd_port: 4369
+  stream_metadata_dir: "/app/rabbitmq_stream_metadata"
+  metadata_dir: "/app/rabbitmq_metadata"

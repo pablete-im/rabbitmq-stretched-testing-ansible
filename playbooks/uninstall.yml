@@ -35,6 +35,30 @@
         - /etc/rabbitmq
         - /var/log/rabbitmq
 
+    # 3.1. Remove custom metadata directories (if defined)
+    - name: Remove stream metadata directory
+      ansible.builtin.file:
+        path: "{{ rabbitmq.stream_metadata_dir }}"
+        state: absent
+      when: 
+        - rabbitmq.stream_metadata_dir is defined
+        - rabbitmq.stream_metadata_dir | length > 0
+
+    - name: Remove Mnesia metadata directory
+      ansible.builtin.file:
+        path: "{{ rabbitmq.metadata_dir }}"
+        state: absent
+      when:
+        - rabbitmq.metadata_dir is defined
+        - rabbitmq.metadata_dir | length > 0
+
+    # 3.2. Remove TLS certificates from system trust store
+    - name: Remove CA certificate from system trust store
+      ansible.builtin.file:
+        path: /etc/pki/ca-trust/source/anchors/rabbitmq-ca.crt
+        state: absent
+      notify: update ca trust
+
     # 4. Revert /etc/hosts changes (Optional - tough to do cleanly without regex, but we can try removing lines matching our hosts)
     - name: Remove cluster nodes from /etc/hosts
       ansible.builtin.lineinfile:
@@ -64,4 +88,16 @@
 
     - name: Cleanup complete
       ansible.builtin.debug:
-        msg: "RabbitMQ uninstalled and configuration reverted on {{ inventory_hostname }}"
+        msg: 
+          - "RabbitMQ uninstalled and configuration reverted on {{ inventory_hostname }}"
+          - "Removed directories:"
+          - "  - /var/lib/rabbitmq"
+          - "  - /etc/rabbitmq"
+          - "  - /var/log/rabbitmq"
+          - "{% if rabbitmq.stream_metadata_dir is defined and rabbitmq.stream_metadata_dir | length > 0 %}  - {{ rabbitmq.stream_metadata_dir }} (stream metadata){% endif %}"
+          - "{% if rabbitmq.metadata_dir is defined and rabbitmq.metadata_dir | length > 0 %}  - {{ rabbitmq.metadata_dir }} (Mnesia metadata){% endif %}"
+
+  handlers:
+    - name: update ca trust
+      ansible.builtin.command:
+        cmd: update-ca-trust

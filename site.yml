@@ -10,9 +10,13 @@
 #   ansible.builtin.import_playbook: playbooks/provision.yml
 #   tags: [provision, infra]
 
+- name: Configure TLS certificates
+  ansible.builtin.import_playbook: playbooks/configure_tls.yml
+  tags: [tls, security, rmq]
+
 - name: Install Tanzu RabbitMQ
   ansible.builtin.import_playbook: playbooks/install_rmq.yml
-  tags: [install, rmq]
+  tags: [install, cluster, rmq]
 
 # - name: Form RabbitMQ Clusters
 #   ansible.builtin.import_playbook: playbooks/cluster_rmq.yml

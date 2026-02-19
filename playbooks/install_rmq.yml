@@ -18,8 +18,6 @@
     #broadcom_download_url: "packages.broadcom.com/artifactory/rabbitmq-rpm/{{ rmq_rpm_filename }}"
     
     erlang_cookie: "TANZURMQANSIBLELABCOOKIE123" # Should be in vault for prod
-    stream_metadata_dir: "/app/rabbitmq_stream_metadata"
-    metadata_dir: "/app/rabbitmq_metadata"
 
   tasks:
     # 0. Check for local RPM on controller
@@ -126,6 +124,20 @@
         state: present
         disable_gpg_check: yes
 
+    # 4.5. Fix TLS certificate ownership (now that rabbitmq user exists)
+    - name: Fix TLS certificate ownership
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: rabbitmq
+        group: rabbitmq
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "/etc/rabbitmq/tls", mode: "0750" }
+        - { path: "/etc/rabbitmq/tls/ca.crt", mode: "0644" }
+        - { path: "/etc/rabbitmq/tls/server.crt", mode: "0644" }
+        - { path: "/etc/rabbitmq/tls/server.key", mode: "0600" }
+      ignore_errors: true
+
     # 5. Configure Erlang Cookie (BEFORE starting)
     - name: Set Erlang Cookie
       ansible.builtin.copy:
@@ -138,22 +150,22 @@
     # 6. Configure RabbitMQ
     - name: Ensure the stream metadata dir custom directory exists
       ansible.builtin.file:
-        path: "{{ stream_metadata_dir }}"
+        path: "{{ rabbitmq.stream_metadata_dir }}"
         state: directory
         owner: rabbitmq
         group: rabbitmq
         mode: '0755'
         recurse: yes
-      when: stream_metadata_dir is defined
+      when: rabbitmq.stream_metadata_dir is defined
     - name: Ensure the metadata dir custom directory exists
       ansible.builtin.file:
-        path: "{{ metadata_dir }}"
+        path: "{{ rabbitmq.metadata_dir }}"
         state: directory
         owner: rabbitmq
         group: rabbitmq
         mode: '0755'
         recurse: yes
-      when: metadata_dir is defined
+      when: rabbitmq.metadata_dir is defined
     - name: Deploy rabbitmq-env.conf
       ansible.builtin.template:
         src: ../templates/rabbitmq-env.conf.j2
@@ -168,6 +180,15 @@
         owner: rabbitmq
         group: rabbitmq
         mode: '0644'
+    
+    # Note: vm.args disabled temporarily to avoid conflicts with rabbitmq-env.conf
+    # - name: Deploy vm.args for TLS distribution
+    #   ansible.builtin.template:
+    #     src: ../templates/vm.args.j2
+    #     dest: /etc/rabbitmq/vm.args
+    #     owner: rabbitmq
+    #     group: rabbitmq
+    #     mode: '0644'
     
     # 7. Enable Plugins
     - name: Enable Management Plugin

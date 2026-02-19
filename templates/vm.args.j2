@@ -1,0 +1,28 @@
+## RabbitMQ VM arguments
+## Managed by Ansible
+
+## Name of the node
+-name rabbit@{{ hostvars[inventory_hostname]['name'] | default(inventory_hostname) }}
+
+## Cookie for distributed node communication
+-setcookie {{ erlang_cookie | default('CHANGEME') }}
+
+## Reduce the heartbeat timeout from the default of 60s to 30s
+## to detect network failures faster
+-kernel inet_dist_listen_min 25672
+-kernel inet_dist_listen_max 25672
+
+## Memory and performance tuning
++P 1048576
++t 5000000
++stbt db
++zdbbl 128000
++sbwt none
++sbwtdcpu none
++sbwtdio none
+
+## Enable kernel polling
++K true
+
+## Increase ETS table limit
++e 256000

@@ -30,3 +30,9 @@ perf-tests/tools/
 
 # BINARIES
 bin/
+
+# PKI Config and keys
+pki/ca.key
+pki/ca.srl
+pki/*.conf
+pki/*.csr

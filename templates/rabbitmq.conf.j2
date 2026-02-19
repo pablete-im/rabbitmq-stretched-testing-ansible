@@ -2,20 +2,62 @@
 # Managed by Ansible
 
 # ============================================
-# Networking
+# Basic Networking
 # ============================================
+# Regular AMQP listener
 listeners.tcp.default = 5672
+
+# TLS AMQP listener (1-way TLS - server authentication only)
+listeners.ssl.default = 5671
+ssl_options.cacertfile = /etc/rabbitmq/tls/ca.crt
+ssl_options.certfile = /etc/rabbitmq/tls/server.crt
+ssl_options.keyfile = /etc/rabbitmq/tls/server.key
+ssl_options.verify = verify_none
+ssl_options.fail_if_no_peer_cert = false
+
+# Management interface
 management.listener.port = 15672
-management.listener.ssl = false
+
+# Management HTTPS
+management.ssl.port = 15671
+management.ssl.cacertfile = /etc/rabbitmq/tls/ca.crt
+management.ssl.certfile = /etc/rabbitmq/tls/server.crt
+management.ssl.keyfile = /etc/rabbitmq/tls/server.key
+
+## More TLS options
+management.ssl.honor_cipher_order   = true
+management.ssl.honor_ecc_order      = true
+
+## These are highly recommended for TLSv1.2 but cannot be used
+## with TLSv1.3. If TLSv1.3 is enabled, these lines MUST be removed.
+management.ssl.client_renegotiation = false
+management.ssl.secure_renegotiate   = true
+
+## Supported TLS versions
+management.ssl.versions.1 = tlsv1.2
+
+## Cipher suites the server is allowed to use
+management.ssl.ciphers.1 = ECDHE-ECDSA-AES256-GCM-SHA384
+management.ssl.ciphers.2 = ECDHE-RSA-AES256-GCM-SHA384
+management.ssl.ciphers.3 = ECDHE-ECDSA-AES256-SHA384
+management.ssl.ciphers.4 = ECDHE-RSA-AES256-SHA384
+management.ssl.ciphers.5 = ECDH-ECDSA-AES256-GCM-SHA384
+management.ssl.ciphers.6 = ECDH-RSA-AES256-GCM-SHA384
+management.ssl.ciphers.7 = ECDH-ECDSA-AES256-SHA384
+management.ssl.ciphers.8 = ECDH-RSA-AES256-SHA384
+management.ssl.ciphers.9 = DHE-RSA-AES256-GCM-SHA384
+
+# Security
 loopback_users.guest = false
 
 # ============================================
-# Stream Plugin
+# Stream Plugin (Basic)
 # ============================================
 stream.advertised_host = {{ ansible_host }}
 stream.listeners.tcp.1 = 5552
-{% if stream_metadata_dir is defined %}
-stream.data_dir = {{ stream_metadata_dir }}
+stream.listeners.ssl.1 = 5551
+{% if rabbitmq.stream_metadata_dir is defined %}
+stream.data_dir = {{ rabbitmq.stream_metadata_dir }}
 {% endif %}
 
 # ============================================

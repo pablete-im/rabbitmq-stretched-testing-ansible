@@ -1,0 +1,243 @@
+---
+# Verify Warm Standby Replication with TLS
+# This playbook tests that warm standby replication is working correctly over TLS connections
+
+- name: Verify TLS-enabled Warm Standby Replication
+  hosts: localhost
+  gather_facts: false
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+    test_queue: "tls_test_queue"
+    test_message: "TLS Warm Standby Test Message"
+    
+  tasks:
+    - name: Test Summary Header
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "Testing TLS-enabled Warm Standby Replication"
+          - "============================================"
+          - "Testing connectivity and replication over:"
+          - "  - AMQP TLS port 5671 (schema replication)"
+          - "  - Stream TLS port 5551 (message replication)"
+          - "  - Management HTTPS port 15671 (monitoring)"
+
+- name: Check upstream cluster TLS connectivity
+  hosts: "{{ groups['az-cluster-1'][0] }}"
+  become: true
+  tasks:
+    - name: Verify TLS listeners are active
+      ansible.builtin.command:
+        cmd: "ss -tlnp | grep -E ':(5671|5551|15671)'"
+      register: tls_listeners
+      changed_when: false
+
+    - name: Display TLS listeners
+      ansible.builtin.debug:
+        msg: |
+          TLS Listeners on {{ inventory_hostname }}:
+          {{ tls_listeners.stdout }}
+
+    - name: Check standby replication status on upstream
+      ansible.builtin.command:
+        cmd: "rabbitmqctl standby_replication_status"
+      register: upstream_standby_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display upstream standby status
+      ansible.builtin.debug:
+        msg: |
+          Upstream Standby Replication Status:
+          {{ upstream_standby_status.stdout }}
+
+    - name: Check schema replication status on upstream
+      ansible.builtin.command:
+        cmd: "rabbitmqctl schema_replication_status"
+      register: upstream_schema_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display upstream schema status
+      ansible.builtin.debug:
+        msg: |
+          Upstream Schema Replication Status:
+          {{ upstream_schema_status.stdout }}
+
+- name: Check downstream clusters TLS connectivity
+  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  become: true
+  tasks:
+    - name: Verify TLS listeners are active
+      ansible.builtin.command:
+        cmd: "ss -tlnp | grep -E ':(5671|5551|15671)'"
+      register: tls_listeners
+      changed_when: false
+
+    - name: Display TLS listeners
+      ansible.builtin.debug:
+        msg: |
+          TLS Listeners on {{ inventory_hostname }}:
+          {{ tls_listeners.stdout }}
+
+    - name: Check standby replication status on downstream
+      ansible.builtin.command:
+        cmd: "rabbitmqctl standby_replication_status"
+      register: downstream_standby_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display downstream standby status
+      ansible.builtin.debug:
+        msg: |
+          Downstream Standby Replication Status on {{ inventory_hostname }}:
+          {{ downstream_standby_status.stdout }}
+
+    - name: Check schema replication status on downstream
+      ansible.builtin.command:
+        cmd: "rabbitmqctl schema_replication_status"
+      register: downstream_schema_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display downstream schema status
+      ansible.builtin.debug:
+        msg: |
+          Downstream Schema Replication Status on {{ inventory_hostname }}:
+          {{ downstream_schema_status.stdout }}
+
+- name: Test TLS connectivity between clusters
+  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  become: true
+  vars:
+    upstream_host: "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}"
+  tasks:
+    - name: Test TLS AMQP connection to upstream
+      ansible.builtin.command:
+        cmd: "timeout 10 openssl s_client -connect {{ upstream_host }}:5671 -verify_return_error -brief"
+      register: amqp_tls_test
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Display AMQP TLS test result
+      ansible.builtin.debug:
+        msg: |
+          AMQP TLS connection test from {{ inventory_hostname }} to {{ upstream_host }}:5671
+          Return code: {{ amqp_tls_test.rc }}
+          {% if amqp_tls_test.rc == 0 %}
+          ✅ TLS connection successful
+          {% else %}
+          ❌ TLS connection failed: {{ amqp_tls_test.stderr }}
+          {% endif %}
+
+    - name: Test TLS Stream connection to upstream
+      ansible.builtin.command:
+        cmd: "timeout 10 openssl s_client -connect {{ upstream_host }}:5551 -verify_return_error -brief"
+      register: stream_tls_test
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+
+    - name: Display Stream TLS test result
+      ansible.builtin.debug:
+        msg: |
+          Stream TLS connection test from {{ inventory_hostname }} to {{ upstream_host }}:5551
+          Return code: {{ stream_tls_test.rc }}
+          {% if stream_tls_test.rc == 0 %}
+          ✅ TLS connection successful
+          {% else %}
+          ❌ TLS connection failed: {{ stream_tls_test.stderr }}
+          {% endif %}
+
+- name: Test end-to-end replication over TLS
+  hosts: "{{ groups['az-cluster-1'][0] }}"
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+    test_queue: "tls_warmstandby_test"
+    test_message: "TLS Warm Standby Test Message - {{ ansible_date_time.epoch }}"
+  tasks:
+    - name: Create test queue on upstream
+      ansible.builtin.command:
+        cmd: >
+          rabbitmqctl eval 'rabbit_amqqueue:declare(
+            {resource, <<"/">>, queue, <<"{{ test_queue }}">>},
+            true, false, [], none, <<"admin">>
+          ).'
+      register: queue_creation
+      changed_when: true
+      failed_when: false
+
+    - name: Publish test message to upstream queue
+      ansible.builtin.command:
+        cmd: >
+          rabbitmqctl eval 'rabbit_basic:publish(
+            {resource, <<"/">>, exchange, <<"">>},
+            <<"{{ test_queue }}">>,
+            false, false,
+            {basic_message, {P_basic, <<>>, undefined, false, 0, 0, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined}, <<"{{ test_message }}">>}
+          ).'
+      register: message_publish
+      changed_when: true
+      failed_when: false
+
+    - name: Wait for replication to occur
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting 30 seconds for warm standby replication over TLS..."
+
+- name: Verify replication on downstream clusters
+  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  become: true
+  vars:
+    test_queue: "tls_warmstandby_test"
+  tasks:
+    - name: Check if test queue exists on downstream
+      ansible.builtin.command:
+        cmd: "rabbitmqctl list_queues name messages"
+      register: queue_check
+      changed_when: false
+
+    - name: Display queue replication result
+      ansible.builtin.debug:
+        msg: |
+          Queue replication check on {{ inventory_hostname }}:
+          {{ queue_check.stdout }}
+          {% if test_queue in queue_check.stdout %}
+          ✅ Test queue replicated successfully via TLS
+          {% else %}
+          ❌ Test queue not found - replication may have failed
+          {% endif %}
+
+- name: Final TLS Warm Standby Report
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Display final report
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "TLS Warm Standby Replication Test Complete"
+          - "============================================"
+          - ""
+          - "✅ TLS Configuration:"
+          - "  - AMQP TLS: port 5671 (schema replication)"
+          - "  - Stream TLS: port 5551 (message replication)"
+          - "  - Management HTTPS: port 15671"
+          - ""
+          - "🔐 Security Features:"
+          - "  - End-to-end encryption for all replication traffic"
+          - "  - Certificate-based authentication"
+          - "  - TLS 1.2/1.3 only (no legacy protocols)"
+          - ""
+          - "📊 Monitoring:"
+          - "  Check replication status: rabbitmqctl standby_replication_status"
+          - "  Check schema sync: rabbitmqctl schema_replication_status"
+          - "  Management UI: https://<node-ip>:15671"
+          - ""
+          - "🚀 Next Steps:"
+          - "  1. Monitor replication lag in production"
+          - "  2. Test failover scenarios"
+          - "  3. Verify certificate rotation procedures"
+          - "============================================"

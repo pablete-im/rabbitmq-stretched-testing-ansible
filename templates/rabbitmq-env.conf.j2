@@ -1,4 +1,4 @@
 NODENAME=rabbit@{{ inventory_hostname }}
-{% if metadata_dir is defined %}
-RABBITMQ_MNESIA_DIR={{ metadata_dir }}
+{% if rabbitmq.metadata_dir is defined %}
+RABBITMQ_MNESIA_DIR={{ rabbitmq.metadata_dir }}
 {% endif %}

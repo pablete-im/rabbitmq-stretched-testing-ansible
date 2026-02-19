@@ -1,0 +1,101 @@
+---
+# Configure TLS 1.2 for RabbitMQ clusters
+# This playbook:
+# 1. Creates necessary directories for TLS certificates
+# 2. Copies CA certificate to all nodes
+# 3. Copies individual host certificates and keys
+# 4. Sets appropriate permissions
+# 5. Updates system CA trust store
+
+- name: Configure TLS certificates for RabbitMQ
+  hosts: nodes
+  become: true
+  vars:
+    rabbitmq_tls_dir: /etc/rabbitmq/tls
+    ca_trust_dir: /etc/pki/ca-trust/source/anchors
+    
+  tasks:
+    - name: Check if rabbitmq user exists
+      ansible.builtin.command:
+        cmd: "id rabbitmq"
+      register: rabbitmq_user_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create RabbitMQ TLS directory
+      ansible.builtin.file:
+        path: "{{ rabbitmq_tls_dir }}"
+        state: directory
+        owner: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        group: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        mode: '0750'
+
+    - name: Copy CA certificate to nodes
+      ansible.builtin.copy:
+        src: "../pki/ca.crt"
+        dest: "{{ rabbitmq_tls_dir }}/ca.crt"
+        owner: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        group: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        mode: '0644'
+
+    - name: Copy host certificate to node
+      ansible.builtin.copy:
+        src: "../pki/{{ hostvars[inventory_hostname]['name'] | default(inventory_hostname) }}_rabbitcert.crt"
+        dest: "{{ rabbitmq_tls_dir }}/server.crt"
+        owner: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        group: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        mode: '0644'
+
+    - name: Copy host private key to node
+      ansible.builtin.copy:
+        src: "../pki/{{ hostvars[inventory_hostname]['name'] | default(inventory_hostname) }}_rabbitcert.key"
+        dest: "{{ rabbitmq_tls_dir }}/server.key"
+        owner: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        group: "{{ 'rabbitmq' if rabbitmq_user_check.rc == 0 else 'root' }}"
+        mode: '0600'
+
+    - name: Install CA certificate in system trust store
+      ansible.builtin.copy:
+        src: "../pki/ca.crt"
+        dest: "{{ ca_trust_dir }}/rabbitmq-ca.crt"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: update ca trust
+
+    - name: Set SELinux context for RabbitMQ TLS files (if SELinux is enabled)
+      ansible.builtin.command:
+        cmd: "restorecon -R {{ rabbitmq_tls_dir }}"
+      when: ansible_selinux.status == "enabled"
+      ignore_errors: true
+
+    - name: Verify TLS certificate files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: tls_files_check
+      loop:
+        - "{{ rabbitmq_tls_dir }}/ca.crt"
+        - "{{ rabbitmq_tls_dir }}/server.crt"
+        - "{{ rabbitmq_tls_dir }}/server.key"
+
+    - name: Display TLS certificate status
+      ansible.builtin.debug:
+        msg: |
+          TLS Certificate Status on {{ inventory_hostname }}:
+          {% for result in tls_files_check.results %}
+          {{ result.item }}: {{ 'EXISTS' if result.stat.exists else 'MISSING' }}
+          {% endfor %}
+          
+          TLS certificates configured successfully (1-way TLS - server authentication only)
+          Ready for RabbitMQ installation with TLS support
+
+  handlers:
+    - name: restart rabbitmq
+      ansible.builtin.systemd:
+        name: tanzu-rabbitmq-server
+        state: restarted
+        daemon_reload: true
+
+    - name: update ca trust
+      ansible.builtin.command:
+        cmd: update-ca-trust

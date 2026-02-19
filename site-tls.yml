@@ -1,0 +1,19 @@
+---
+# Master playbook for TLS-enabled deployment
+# This version installs RabbitMQ step by step with TLS
+#
+# Usage:
+#   Full deployment with TLS: ansible-playbook site-tls.yml
+#
+
+- name: Install RabbitMQ with TLS (Step by Step)
+  ansible.builtin.import_playbook: playbooks/install_rmq_step_by_step.yml
+  tags: [install, rmq, tls]
+
+- name: Configure Network Latency Simulation
+  ansible.builtin.import_playbook: playbooks/configure_latency.yml
+  tags: [latency, network]
+
+- name: Configure Warm Standby Replication
+  ansible.builtin.import_playbook: playbooks/configure_warm_standby.yml
+  tags: [standby, federation, rmq]

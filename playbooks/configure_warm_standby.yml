@@ -10,8 +10,8 @@
 #   Arizona region failure → Promote TX-Cluster-1
 #
 # Two subsystems work together:
-#   1. Schema Definition Sync   - replicates vhosts, users, queues, exchanges, policies (AMQP port 5672)
-#   2. Standby Message Replication - replicates messages via streams (stream port 5552)
+#   1. Schema Definition Sync   - replicates vhosts, users, queues, exchanges, policies (AMQP TLS port 5671)
+#   2. Standby Message Replication - replicates messages via streams (stream TLS port 5551)
 
 # ============================================
 # Phase 1: Enable required plugins on all nodes
@@ -44,13 +44,13 @@
       changed_when: "'already enabled' not in result.stdout"
 
 # ============================================
-# Phase 2: Create admin user on upstream BEFORE schema sync
+# Phase 2: Create admin user on ALL clusters BEFORE schema sync
 # ============================================
-# The admin user must exist before schema_definition_sync is activated.
+# The admin user must exist on all clusters before schema_definition_sync is activated.
 # Once schema sync is running, it continuously enforces the schema baseline
 # captured at startup. Users added after sync is active get wiped.
-- name: Create admin user on upstream
-  hosts: "{{ groups['az-cluster-1'][0] }}"
+- name: Create admin user on all clusters
+  hosts: "{{ groups['az-cluster-1'][0] }},{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
   become: true
   vars:
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
@@ -71,6 +71,12 @@
         rabbitmqctl set_permissions -p / {{ rabbitmq.admin_user }} ".*" ".*" ".*"
       changed_when: true
 
+    - name: Delete guest user (security)
+      ansible.builtin.command: rabbitmqctl delete_user guest
+      register: guest_result
+      changed_when: guest_result.rc == 0
+      failed_when: false
+
 # ============================================
 # Phase 3: Configure upstream cluster (AZ-Cluster-1) config and restart
 # ============================================
@@ -88,6 +94,47 @@
         owner: rabbitmq
         group: rabbitmq
         mode: '0644'
+
+    - name: Server Certificate File for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.certfile = /etc/rabbitmq/tls/server.crt"
+        regexp: '^schema_definition_sync\.ssl_options\.certfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'    
+
+    - name: Server Key File for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.keyfile = /etc/rabbitmq/tls/server.key"
+        regexp: '^schema_definition_sync\.ssl_options\.keyfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
+    - name: Verify Peer for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.verify = verify_none"
+        regexp: '^schema_definition_sync\.ssl_options\.verify'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
+
+    - name: Fail if no Peer certificate for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.fail_if_no_peer_cert = false"
+        regexp: '^schema_definition_sync\.ssl_options\.fail_if_no_peer_cert'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
 
     - name: Set standby replication operating mode to upstream
       ansible.builtin.lineinfile:
@@ -124,17 +171,13 @@
       until: result.rc == 0
 
 # ============================================
-# Phase 4: Configure upstream replication settings
+# Phase 4A: Create replication user on ALL clusters
 # ============================================
-- name: Configure upstream cluster replication
-  hosts: "{{ groups['az-cluster-1'][0] }}"
+- name: Create replication user on all clusters
+  hosts: "{{ groups['az-cluster-1'][0] }},{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
   become: true
   vars:
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
-    upstream_endpoints_list:
-      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5672"
-      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5672"
-      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5672"
   tasks:
     - name: Create schema definition sync internal vhost
       ansible.builtin.command: rabbitmqctl add_vhost rabbitmq_schema_definition_sync
@@ -142,18 +185,40 @@
       changed_when: result.rc == 0
       failed_when: result.rc != 0 and 'already exists' not in result.stderr
 
-    - name: Create schema replication user
+    - name: Create replication user (regular user, not schema_replication_user)
       ansible.builtin.command: >
-        rabbitmqctl add_schema_replication_user
-        {{ rabbitmq.replication_user }} {{ rmq_password }}
+        rabbitmqctl add_user {{ rabbitmq.replication_user }} {{ rmq_password }}
       register: result
       changed_when: result.rc == 0
       failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Set replication user tags
+      ansible.builtin.command: rabbitmqctl set_user_tags {{ rabbitmq.replication_user }} administrator
+      changed_when: true
 
     - name: Set replication user permissions on default vhost
       ansible.builtin.command: >
         rabbitmqctl set_permissions -p / {{ rabbitmq.replication_user }} ".*" ".*" ".*"
       changed_when: true
+
+    - name: Set replication user permissions on schema sync vhost
+      ansible.builtin.command: >
+        rabbitmqctl set_permissions -p rabbitmq_schema_definition_sync {{ rabbitmq.replication_user }} ".*" ".*" ".*"
+      changed_when: true
+
+# ============================================
+# Phase 4B: Configure upstream replication settings
+# ============================================
+- name: Configure upstream cluster replication
+  hosts: "{{ groups['az-cluster-1'][0] }}"
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+    upstream_endpoints_list:
+      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5671"
+      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5671"
+      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5671"
+  tasks:
 
     - name: Set schema replication upstream endpoints on upstream
       ansible.builtin.command: >
@@ -219,6 +284,57 @@
         group: rabbitmq
         mode: '0644'
 
+    - name: CA Certificate File for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.cacertfile = /etc/rabbitmq/tls/ca.crt"
+        regexp: '^schema_definition_sync\.ssl_options\.cacertfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'    
+    
+    - name: Server Certificate File for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.certfile = /etc/rabbitmq/tls/server.crt"
+        regexp: '^schema_definition_sync\.ssl_options\.certfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'    
+
+    - name: Server Key File for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.keyfile = /etc/rabbitmq/tls/server.key"
+        regexp: '^schema_definition_sync\.ssl_options\.keyfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
+    - name: Verify Peer for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.verify = verify_none"
+        regexp: '^schema_definition_sync\.ssl_options\.verify'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
+
+    - name: Fail if no Peer certificate for Schema Definition Sync
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "schema_definition_sync.ssl_options.fail_if_no_peer_cert = false"
+        regexp: '^schema_definition_sync\.ssl_options\.fail_if_no_peer_cert'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
     - name: Set standby replication operating mode to downstream
       ansible.builtin.lineinfile:
         path: /etc/rabbitmq/rabbitmq.conf
@@ -239,6 +355,57 @@
         group: rabbitmq
         mode: '0644'
 
+    - name: CA Certificate File for Standby Replication
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.downstream.ssl_options.cacertfile = /etc/rabbitmq/tls/ca.crt"
+        regexp: '^standby\.replication\.downstream\.ssl_options\.cacertfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'    
+    
+    - name: Server Certificate File for Standby Replication
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.downstream.ssl_options.certfile = /etc/rabbitmq/tls/server.crt"
+        regexp: '^standby\.replication\.downstream\.ssl_options\.certfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'    
+
+    - name: Server Key File for Standby Replication
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.downstream.ssl_options.keyfile = /etc/rabbitmq/tls/server.key"
+        regexp: '^standby\.replication\.downstream\.ssl_options\.keyfile'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
+    - name: Verify Peer for Standby Replication
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.downstream.ssl_options.verify = verify_none"
+        regexp: '^standby\.replication\.downstream\.ssl_options\.verify'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
+
+    - name: Fail if no Peer certificate for Standby Replication
+      ansible.builtin.lineinfile:
+        path: /etc/rabbitmq/rabbitmq.conf
+        line: "standby.replication.downstream.ssl_options.fail_if_no_peer_cert = false"
+        regexp: '^standby\.replication\.downstream\.ssl_options\.fail_if_no_peer_cert'
+        create: true
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'   
+
 # ============================================
 # Phase 5B: Set schema replication endpoints BEFORE restart
 # ============================================
@@ -248,11 +415,11 @@
   vars:
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
     upstream_endpoints_list:
-      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5672"
-      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5672"
-      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5672"
+      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5671"
+      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5671"
+      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5671"
   tasks:
-    - name: Set schema replication upstream endpoints (AMQP port 5672)
+    - name: Set schema replication upstream endpoints (AMQP TLS port 5671)
       ansible.builtin.shell: >
         rabbitmqctl set_schema_replication_upstream_endpoints
         '{{ {"endpoints": upstream_endpoints_list, "username": rabbitmq.replication_user, "password": rmq_password} | to_json }}'
@@ -299,11 +466,11 @@
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
     # Defined as a proper YAML list to ensure correct JSON encoding
     upstream_stream_endpoints_list:
-      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5552"
-      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5552"
-      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5552"
+      - "{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5551"
+      - "{{ hostvars[groups['az-cluster-1'][1]]['ansible_host'] }}:5551"
+      - "{{ hostvars[groups['az-cluster-1'][2]]['ansible_host'] }}:5551"
   tasks:
-    - name: Set standby replication upstream endpoints (stream port 5552)
+    - name: Set standby replication upstream endpoints (stream TLS port 5551)
       ansible.builtin.shell: >
         rabbitmqctl set_standby_replication_upstream_endpoints
         '{{ {"endpoints": upstream_stream_endpoints_list, "username": rabbitmq.replication_user, "password": rmq_password} | to_json }}'
@@ -392,9 +559,14 @@
           - "  AZ-Cluster-1 (upstream) → AZ-Cluster-2 (AZ region standby)"
           - "  AZ-Cluster-1 (upstream) → TX-Cluster-1 (cross-region DR)"
           - ""
+          - "Users Created:"
+          - "  admin: Administrator user on all clusters"
+          - "  replication: Schema/standby replication user on all clusters"
+          - "  guest: Deleted for security"
+          - ""
           - "What is replicated:"
-          - "  Schema:   vhosts, users, queues, exchanges, policies (via schema_definition_sync)"
-          - "  Messages: queue contents (via standby_replication, stream port 5552)"
+          - "  Schema:   vhosts, users, queues, exchanges, policies (via schema_definition_sync over TLS port 5671)"
+          - "  Messages: queue contents (via standby_replication, stream TLS port 5551)"
           - ""
           - "Upstream Cluster:"
           - "  AZ-Cluster-1: {{ groups['az-cluster-1'] | join(', ') }}"
@@ -408,10 +580,10 @@
           - "  Arizona region failure → Promote TX-Cluster-1"
           - "  Command: rabbitmqctl promote_warm_standby"
           - ""
-          - "Management UIs:"
-          - "  AZ-Cluster-1: http://{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:{{ rabbitmq.management_port }}"
-          - "  AZ-Cluster-2: http://{{ hostvars[groups['az-cluster-2'][0]]['ansible_host'] }}:{{ rabbitmq.management_port }}"
-          - "  TX-Cluster-1: http://{{ hostvars[groups['tx-cluster-1'][0]]['ansible_host'] }}:{{ rabbitmq.management_port }}"
+          - "Management UIs (TLS):"
+          - "  AZ-Cluster-1: https://{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:15671"
+          - "  AZ-Cluster-2: https://{{ hostvars[groups['az-cluster-2'][0]]['ansible_host'] }}:15671"
+          - "  TX-Cluster-1: https://{{ hostvars[groups['tx-cluster-1'][0]]['ansible_host'] }}:15671"
           - ""
           - "Verify replication:"
           - "  rabbitmqctl standby_replication_status"
