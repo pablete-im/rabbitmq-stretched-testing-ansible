@@ -28,6 +28,10 @@
 #   ./perf-tests/test-warm-standby.sh --skip-cross-region
 #   ./perf-tests/test-warm-standby.sh --test-promotion  # Actually promotes standby
 #   ./perf-tests/test-warm-standby.sh --no-cleanup      # Leave test queues for analysis
+#
+# TLS Usage:
+#   ./perf-tests/test-warm-standby.sh --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-warm-standby.sh --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -53,6 +57,9 @@ SSH_USER="ansible"
 SKIP_CROSS_REGION=false
 TEST_PROMOTION=false
 CLEANUP=true
+TRUSTSTORE=""
+TRUSTSTORE_PASS=""
+TRUSTSTORE_TYPE="JKS"
 
 # Colors for terminal output (disabled when piped/redirected)
 if [[ -t 1 ]]; then
@@ -78,6 +85,9 @@ while [[ $# -gt 0 ]]; do
         --skip-cross-region) SKIP_CROSS_REGION=true; shift ;;
         --test-promotion)    TEST_PROMOTION=true; shift ;;
         --no-cleanup)        CLEANUP=false; shift ;;
+        --truststore)        TRUSTSTORE="$2"; shift 2 ;;
+        --truststore-pass)   TRUSTSTORE_PASS="$2"; shift 2 ;;
+        --truststore-type)   TRUSTSTORE_TYPE="$2"; shift 2 ;;
         *)                   echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -88,6 +98,31 @@ fi
 if [[ -z "$PASSWORD" ]]; then
     read -rsp "RabbitMQ password for '$USER': " PASSWORD
     echo
+fi
+
+# --- Configure TLS settings ---
+if [[ -n "$TRUSTSTORE" ]]; then
+    echo "🔐 TLS Mode: Using truststore $TRUSTSTORE"
+    MGMT_PROTOCOL="https"
+    MGMT_PORT="15671"
+    AMQP_PROTOCOL="amqps"
+    AMQP_PORT="5671"
+    STREAM_PROTOCOL="rabbitmq-stream+tls"
+    STREAM_PORT="5551"
+    
+    # JVM options for performance tests
+    JVM_OPTS="-Djavax.net.ssl.trustStore=$TRUSTSTORE"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStorePassword=$TRUSTSTORE_PASS"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStoreType=$TRUSTSTORE_TYPE"
+else
+    echo "🔓 Non-TLS Mode: Using standard connections"
+    MGMT_PROTOCOL="http"
+    MGMT_PORT="15672"
+    AMQP_PROTOCOL="amqp"
+    AMQP_PORT="5672"
+    STREAM_PROTOCOL="rabbitmq-stream"
+    STREAM_PORT="5552"
+    JVM_OPTS=""
 fi
 
 # --- Helper functions ---
@@ -198,7 +233,7 @@ vhost_exists() {
     local encoded_vhost
     encoded_vhost=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$vhost', safe=''))")
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "http://${host}:15672/api/vhosts/${encoded_vhost}" 2>/dev/null || echo "000")
+    status=$(curl -sf -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" 2>/dev/null || echo "000")
     [[ "$status" == "200" ]]
 }
 
@@ -208,7 +243,7 @@ create_vhost() {
     local vhost="$2"
     local encoded_vhost
     encoded_vhost=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$vhost', safe=''))")
-    curl -sf -X PUT -u "${USER}:${PASSWORD}" "http://${host}:15672/api/vhosts/${encoded_vhost}" \
+    curl -sf -X PUT -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" \
         -H "Content-Type: application/json" -d '{}' > /dev/null 2>&1
 }
 
@@ -218,14 +253,14 @@ delete_vhost() {
     local vhost="$2"
     local encoded_vhost
     encoded_vhost=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$vhost', safe=''))")
-    curl -sf -X DELETE -u "${USER}:${PASSWORD}" "http://${host}:15672/api/vhosts/${encoded_vhost}" > /dev/null 2>&1 || true
+    curl -sf -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" > /dev/null 2>&1 || true
 }
 
 # Create exchange
 create_exchange() {
     local host="$1"
     local exchange="$2"
-    curl -sf -X PUT -u "${USER}:${PASSWORD}" "http://${host}:15672/api/exchanges/%2F/${exchange}" \
+    curl -sf -X PUT -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${exchange}" \
         -H "Content-Type: application/json" -d '{"type":"direct","durable":true}' > /dev/null 2>&1
 }
 
@@ -233,7 +268,7 @@ create_exchange() {
 delete_exchange() {
     local host="$1"
     local exchange="$2"
-    curl -sf -X DELETE -u "${USER}:${PASSWORD}" "http://${host}:15672/api/exchanges/%2F/${exchange}" > /dev/null 2>&1 || true
+    curl -sf -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${exchange}" > /dev/null 2>&1 || true
 }
 
 # Wait for replication with timeout

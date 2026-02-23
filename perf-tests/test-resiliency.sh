@@ -20,6 +20,10 @@
 # Usage:
 #   ./perf-tests/test-resiliency.sh --host 192.168.20.200
 #   ./perf-tests/test-resiliency.sh --host 192.168.20.200 --skip-chaos
+#
+# TLS Usage:
+#   ./perf-tests/test-resiliency.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-resiliency.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -34,6 +38,9 @@ USER="admin"
 PASSWORD=""
 SKIP_CHAOS=false
 SSH_USER="ansible"
+TRUSTSTORE=""
+TRUSTSTORE_PASS=""
+TRUSTSTORE_TYPE="JKS"
 
 # Cluster nodes (AZ-Cluster-1)
 NODE1_HOST="192.168.20.200"  # az-rmq-01 (Phoenix DC)
@@ -58,12 +65,15 @@ fi
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)       HOST="$2"; shift 2 ;;
-        --user)       USER="$2"; shift 2 ;;
-        --password)   PASSWORD="$2"; shift 2 ;;
-        --ssh-user)   SSH_USER="$2"; shift 2 ;;
-        --skip-chaos) SKIP_CHAOS=true; shift ;;
-        *)            echo "Unknown option: $1"; exit 1 ;;
+        --host)            HOST="$2"; shift 2 ;;
+        --user)            USER="$2"; shift 2 ;;
+        --password)        PASSWORD="$2"; shift 2 ;;
+        --ssh-user)        SSH_USER="$2"; shift 2 ;;
+        --skip-chaos)      SKIP_CHAOS=true; shift ;;
+        --truststore)      TRUSTSTORE="$2"; shift 2 ;;
+        --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
+        --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
+        *)                 echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -75,8 +85,29 @@ if [[ -z "$PASSWORD" ]]; then
     echo
 fi
 
-AMQP_URI="amqp://${USER}:${PASSWORD}@${HOST}:5672"
-MGMT_URL="http://${HOST}:15672"
+# --- Configure TLS settings ---
+if [[ -n "$TRUSTSTORE" ]]; then
+    echo "🔐 TLS Mode: Using truststore $TRUSTSTORE"
+    MGMT_PROTOCOL="https"
+    MGMT_PORT="15671"
+    AMQP_PROTOCOL="amqps"
+    AMQP_PORT="5671"
+    
+    # JVM options for performance tests
+    JVM_OPTS="-Djavax.net.ssl.trustStore=$TRUSTSTORE"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStorePassword=$TRUSTSTORE_PASS"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStoreType=$TRUSTSTORE_TYPE"
+else
+    echo "🔓 Non-TLS Mode: Using standard connections"
+    MGMT_PROTOCOL="http"
+    MGMT_PORT="15672"
+    AMQP_PROTOCOL="amqp"
+    AMQP_PORT="5672"
+    JVM_OPTS=""
+fi
+
+AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${AMQP_PORT}"
+MGMT_URL="${MGMT_PROTOCOL}://${HOST}:${MGMT_PORT}"
 
 # --- Helper functions ---
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -218,7 +249,7 @@ test_quorum_leader_failover() {
 
     # Create quorum queue with messages
     log_info "  Creating quorum queue and publishing messages..."
-    "$TOOLS_DIR/perf-test" \
+    java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
         --uri "$AMQP_URI" \
         --quorum-queue \
         --queue "$queue" \
@@ -299,7 +330,7 @@ test_message_durability() {
 
     # Publish messages with confirms (ensures durability)
     log_info "  Publishing durable messages..."
-    "$TOOLS_DIR/perf-test" \
+    java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
         --uri "$AMQP_URI" \
         --quorum-queue \
         --queue "$queue" \
@@ -349,7 +380,7 @@ test_message_durability() {
 
     # Consume all messages
     log_info "  Consuming messages..."
-    "$TOOLS_DIR/perf-test" \
+    java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
         --uri "$AMQP_URI" \
         --queue "$queue" \
         --producers 0 \
@@ -416,7 +447,7 @@ test_network_partition() {
 
     # Create queue and publish messages
     log_info "  Setting up test queue..."
-    "$TOOLS_DIR/perf-test" \
+    java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
         --uri "$AMQP_URI" \
         --quorum-queue \
         --queue "$queue" \

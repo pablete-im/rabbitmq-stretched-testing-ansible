@@ -49,6 +49,52 @@ Set `RMQ_PASSWORD` to avoid the password prompt:
 export RMQ_PASSWORD="your-admin-password"
 ```
 
+## TLS/SSL Support
+
+All performance test scripts support TLS connections using Java truststore files:
+
+```bash
+# Basic TLS connection (assumes empty truststore password)
+./perf-tests/run-test.sh baseline --host 192.168.20.200 \
+  --truststore /path/to/truststore.p12
+
+# TLS with password-protected truststore
+./perf-tests/run-test.sh baseline --host 192.168.20.200 \
+  --truststore /path/to/truststore.p12 \
+  --truststore-pass mypassword \
+  --truststore-type PKCS12
+
+# TLS with different truststore types
+./perf-tests/run-test.sh baseline --host 192.168.20.200 \
+  --truststore /path/to/truststore.jks \
+  --truststore-type JKS
+```
+
+### TLS Connection Details
+
+When TLS options are specified:
+- **AMQP connections** use `amqps://host:5671` (instead of `amqp://host:5672`)
+- **Stream connections** use `rabbitmq-stream+tls://host:5551` (instead of `rabbitmq-stream://host:5552`)
+- **Management API** uses `https://host:15671` (instead of `http://host:15672`)
+
+### TLS Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--truststore <path>` | Path to Java truststore file | None (no TLS) |
+| `--truststore-pass <password>` | Truststore password | Empty string |
+| `--truststore-type <type>` | Truststore type (PKCS12, JKS, etc.) | PKCS12 |
+
+### Supported Scripts
+
+All performance test scripts support TLS:
+- `run-test.sh` - Main scenario runner
+- `test-warm-standby.sh` - Warm standby replication tests
+- `test-resiliency.sh` - Resiliency and failover tests
+- `test-core-features.sh` - Core broker feature tests
+- `run-latency-sweep.sh` - Latency performance curves
+- `cleanup-test-queues.sh` - Test queue cleanup
+
 ## Scenarios
 
 | Scenario | Type | Description |
@@ -116,6 +162,15 @@ Measure cross-region federation replication performance:
   --con-host 192.168.20.206 \
   --label "az-to-tx"
 ```
+
+**Note:** Federation tests use PerfTest's **instance synchronization** feature to coordinate separate producer and consumer processes. The script automatically:
+
+1. Starts a consumer process on `--con-host` (waits for producer)
+2. Starts a producer process on `--pub-host` (synchronizes with consumer)
+3. Both processes use the same test ID and `--expected-instances 2`
+4. Results are saved to separate files: `results/federation-test-TIMESTAMP.txt` (producer) and `results/federation-test-TIMESTAMP.txt.consumer`
+
+This approach follows RabbitMQ's official recommendation for running producers and consumers on different machines, as documented in the [PerfTest documentation](https://perftest.rabbitmq.com/#running-producers-and-consumers-on-different-machines).
 
 ### 5. Throughput Ceiling
 

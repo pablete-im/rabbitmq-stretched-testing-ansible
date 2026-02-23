@@ -16,6 +16,10 @@
 # Usage:
 #   ./perf-tests/test-core-features.sh --host 192.168.20.200
 #   ./perf-tests/test-core-features.sh --host 192.168.20.200 --verbose
+#
+# TLS Usage:
+#   ./perf-tests/test-core-features.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-core-features.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -30,6 +34,9 @@ PASSWORD=""
 VERBOSE=false
 TEST_DURATION=30
 MESSAGE_COUNT=1000
+TRUSTSTORE=""
+TRUSTSTORE_PASS=""
+TRUSTSTORE_TYPE="JKS"
 
 # Colors for terminal output (disabled when piped/redirected)
 if [[ -t 1 ]]; then
@@ -47,12 +54,15 @@ fi
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)      HOST="$2"; shift 2 ;;
-        --user)      USER="$2"; shift 2 ;;
-        --password)  PASSWORD="$2"; shift 2 ;;
-        --verbose)   VERBOSE=true; shift ;;
-        --duration)  TEST_DURATION="$2"; shift 2 ;;
-        *)           echo "Unknown option: $1"; exit 1 ;;
+        --host)            HOST="$2"; shift 2 ;;
+        --user)            USER="$2"; shift 2 ;;
+        --password)        PASSWORD="$2"; shift 2 ;;
+        --verbose)         VERBOSE=true; shift ;;
+        --duration)        TEST_DURATION="$2"; shift 2 ;;
+        --truststore)      TRUSTSTORE="$2"; shift 2 ;;
+        --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
+        --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
+        *)                 echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -65,8 +75,29 @@ if [[ -z "$PASSWORD" ]]; then
     echo
 fi
 
-AMQP_URI="amqp://${USER}:${PASSWORD}@${HOST}:5672"
-MGMT_URL="http://${HOST}:15672"
+# --- Configure TLS settings ---
+if [[ -n "$TRUSTSTORE" ]]; then
+    echo "🔐 TLS Mode: Using truststore $TRUSTSTORE"
+    MGMT_PROTOCOL="https"
+    MGMT_PORT="15671"
+    AMQP_PROTOCOL="amqps"
+    AMQP_PORT="5671"
+    
+    # JVM options for performance tests
+    JVM_OPTS="-Djavax.net.ssl.trustStore=$TRUSTSTORE"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStorePassword=$TRUSTSTORE_PASS"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStoreType=$TRUSTSTORE_TYPE"
+else
+    echo "🔓 Non-TLS Mode: Using standard connections"
+    MGMT_PROTOCOL="http"
+    MGMT_PORT="15672"
+    AMQP_PROTOCOL="amqp"
+    AMQP_PORT="5672"
+    JVM_OPTS=""
+fi
+
+AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${AMQP_PORT}"
+MGMT_URL="${MGMT_PROTOCOL}://${HOST}:${MGMT_PORT}"
 
 # --- Helper functions ---
 log_info() {
@@ -122,7 +153,7 @@ run_perf_test() {
 
     local output
     local exit_code=0
-    output=$("$TOOLS_DIR/perf-test" \
+    output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
         --uri "$AMQP_URI" \
         --time "$TEST_DURATION" \
         --id "$test_name" \

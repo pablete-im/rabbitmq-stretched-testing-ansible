@@ -15,6 +15,10 @@
 #   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200
 #   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --quick
 #   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --no-restore
+#
+# TLS Usage:
+#   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -31,6 +35,9 @@ SSH_USER="ansible"
 QUICK_MODE=false
 TEST_DURATION=60
 RESTORE_LATENCY=true
+TRUSTSTORE=""
+TRUSTSTORE_PASS=""
+TRUSTSTORE_TYPE="JKS"
 
 # Latency values to test (milliseconds)
 # Full sweep
@@ -61,14 +68,17 @@ fi
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)      HOST="$2"; shift 2 ;;
-        --user)      USER="$2"; shift 2 ;;
-        --password)  PASSWORD="$2"; shift 2 ;;
-        --ssh-user)  SSH_USER="$2"; shift 2 ;;
-        --quick)     QUICK_MODE=true; shift ;;
-        --duration)  TEST_DURATION="$2"; shift 2 ;;
-        --no-restore) RESTORE_LATENCY=false; shift ;;
-        *)           echo "Unknown option: $1"; exit 1 ;;
+        --host)            HOST="$2"; shift 2 ;;
+        --user)            USER="$2"; shift 2 ;;
+        --password)        PASSWORD="$2"; shift 2 ;;
+        --ssh-user)        SSH_USER="$2"; shift 2 ;;
+        --quick)           QUICK_MODE=true; shift ;;
+        --duration)        TEST_DURATION="$2"; shift 2 ;;
+        --no-restore)      RESTORE_LATENCY=false; shift ;;
+        --truststore)      TRUSTSTORE="$2"; shift 2 ;;
+        --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
+        --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
+        *)                 echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -80,12 +90,29 @@ if [[ -z "$PASSWORD" ]]; then
     echo
 fi
 
+# --- Configure TLS settings ---
+if [[ -n "$TRUSTSTORE" ]]; then
+    echo "🔐 TLS Mode: Using truststore $TRUSTSTORE"
+    AMQP_PROTOCOL="amqps"
+    AMQP_PORT="5671"
+    
+    # JVM options for performance tests
+    JVM_OPTS="-Djavax.net.ssl.trustStore=$TRUSTSTORE"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStorePassword=$TRUSTSTORE_PASS"
+    JVM_OPTS="$JVM_OPTS -Djavax.net.ssl.trustStoreType=$TRUSTSTORE_TYPE"
+else
+    echo "🔓 Non-TLS Mode: Using standard connections"
+    AMQP_PROTOCOL="amqp"
+    AMQP_PORT="5672"
+    JVM_OPTS=""
+fi
+
 if $QUICK_MODE; then
     LATENCY_VALUES=("${QUICK_LATENCY_VALUES[@]}")
     TEST_DURATION=30
 fi
 
-AMQP_URI="amqp://${USER}:${PASSWORD}@${HOST}:5672"
+AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${AMQP_PORT}"
 
 # --- Helper functions ---
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -174,7 +201,7 @@ run_perf_test() {
     log_info "Running performance test at ${latency_ms}ms latency..." >&2
 
     # Run enterprise-typical workload: 5KB messages, 3k msg/s target, 2 publishers, 2 consumers
-    output=$("$TOOLS_DIR/perf-test" \
+    output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
         --uri "$AMQP_URI" \
         --quorum-queue \
         --queue "$queue" \

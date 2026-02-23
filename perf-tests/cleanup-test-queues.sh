@@ -10,6 +10,10 @@
 #   ./perf-tests/cleanup-test-queues.sh --pattern "warm-*" # Clean specific pattern
 #   ./perf-tests/cleanup-test-queues.sh --dry-run          # Show what would be deleted
 #   ./perf-tests/cleanup-test-queues.sh --all-clusters     # Clean all 4 clusters
+#
+# TLS Usage:
+#   ./perf-tests/cleanup-test-queues.sh --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/cleanup-test-queues.sh --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -24,6 +28,9 @@ PASSWORD=""
 DRY_RUN=false
 ALL_CLUSTERS=false
 PATTERN=""
+TRUSTSTORE=""
+TRUSTSTORE_PASS=""
+TRUSTSTORE_TYPE="JKS"
 
 # Test queue patterns to clean
 TEST_PATTERNS=(
@@ -40,12 +47,15 @@ TEST_PATTERNS=(
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --user)        USER="$2"; shift 2 ;;
-        --password)    PASSWORD="$2"; shift 2 ;;
-        --dry-run)     DRY_RUN=true; shift ;;
-        --all-clusters) ALL_CLUSTERS=true; shift ;;
-        --pattern)     PATTERN="$2"; shift 2 ;;
-        *)             echo "Unknown option: $1"; exit 1 ;;
+        --user)            USER="$2"; shift 2 ;;
+        --password)        PASSWORD="$2"; shift 2 ;;
+        --dry-run)         DRY_RUN=true; shift ;;
+        --all-clusters)    ALL_CLUSTERS=true; shift ;;
+        --pattern)         PATTERN="$2"; shift 2 ;;
+        --truststore)      TRUSTSTORE="$2"; shift 2 ;;
+        --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
+        --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
+        *)                 echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -55,6 +65,17 @@ fi
 if [[ -z "$PASSWORD" ]]; then
     read -rsp "RabbitMQ password for '$USER': " PASSWORD
     echo
+fi
+
+# --- Configure TLS settings ---
+if [[ -n "$TRUSTSTORE" ]]; then
+    echo "🔐 TLS Mode: Using truststore $TRUSTSTORE"
+    MGMT_PROTOCOL="https"
+    MGMT_PORT="15671"
+else
+    echo "🔓 Non-TLS Mode: Using standard connections"
+    MGMT_PROTOCOL="http"
+    MGMT_PORT="15672"
 fi
 
 # Build list of hosts to clean
@@ -104,7 +125,7 @@ delete_queue() {
     local status
     status=$(curl -sf -o /dev/null -w "%{http_code}" -X DELETE \
         -u "${USER}:${PASSWORD}" \
-        "http://${host}:15672/api/queues/%2F/${encoded_queue}" 2>/dev/null || echo "000")
+        "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues/%2F/${encoded_queue}" 2>/dev/null || echo "000")
 
     if [[ "$status" == "204" ]] || [[ "$status" == "200" ]]; then
         echo "  Deleted: $queue"
@@ -137,7 +158,7 @@ for host in "${HOSTS[@]}"; do
     echo "Checking $host..."
 
     # Get all queues
-    queues=$(curl -sf -u "${USER}:${PASSWORD}" "http://${host}:15672/api/queues" 2>/dev/null | \
+    queues=$(curl -sf -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues" 2>/dev/null | \
         python3 -c "import sys,json; [print(q['name']) for q in json.load(sys.stdin)]" 2>/dev/null) || {
         echo "  Failed to connect to $host"
         continue
