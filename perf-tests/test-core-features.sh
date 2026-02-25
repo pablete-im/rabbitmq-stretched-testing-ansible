@@ -14,12 +14,12 @@
 #   6. Quorum queue replication
 #
 # Usage:
-#   ./perf-tests/test-core-features.sh --host 192.168.20.200
-#   ./perf-tests/test-core-features.sh --host 192.168.20.200 --verbose
+#   ./perf-tests/test-core-features.sh --host 10.85.10.234
+#   ./perf-tests/test-core-features.sh --host 10.85.10.234 --verbose
 #
 # TLS Usage:
-#   ./perf-tests/test-core-features.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
-#   ./perf-tests/test-core-features.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-core-features.sh --host 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-core-features.sh --host 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -28,7 +28,7 @@ TOOLS_DIR="$SCRIPT_DIR/tools"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Defaults
-HOST="192.168.20.200"
+HOST="10.85.10.234"
 USER="admin"
 PASSWORD=""
 VERBOSE=false
@@ -124,7 +124,7 @@ verbose() {
 
 # Check if management API is accessible
 check_management_api() {
-    if curl -sf -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/overview" > /dev/null 2>&1; then
+    if curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/overview" > /dev/null 2>&1; then
         return 0
     else
         return 1
@@ -133,14 +133,14 @@ check_management_api() {
 
 # Get cluster nodes from management API
 get_cluster_nodes() {
-    curl -sf -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/nodes" | \
+    curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/nodes" | \
         python3 -c "import sys, json; print(' '.join([n['name'] for n in json.load(sys.stdin)]))"
 }
 
 # Check quorum queue leader location
 get_quorum_leader() {
     local queue="$1"
-    curl -sf -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/queues/%2F/${queue}" | \
+    curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/queues/%2F/${queue}" | \
         python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('leader', 'unknown'))" 2>/dev/null || echo "unknown"
 }
 
@@ -326,9 +326,9 @@ do
     echo "" >> "$RESULT_FILE"
     # Run test, display with colors, strip colors for file
     if $test_func 2>&1 | tee >(strip_ansi >> "$RESULT_FILE"); then
-        ((TESTS_PASSED++))
+        ((TESTS_PASSED+=1))
     else
-        ((TESTS_FAILED++))
+        ((TESTS_FAILED+=1))
     fi
 done
 

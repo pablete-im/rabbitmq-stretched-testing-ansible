@@ -10,17 +10,17 @@
 #
 # Examples:
 #   ./perf-tests/run-test.sh baseline
-#   ./perf-tests/run-test.sh baseline --host 192.168.20.200
-#   ./perf-tests/run-test.sh streams --host 192.168.20.200
-#   ./perf-tests/run-test.sh federation-test --pub-host 192.168.20.200 --con-host 192.168.20.206
-#   ./perf-tests/run-test.sh baseline --host 192.168.20.200 --label "with-latency"
+#   ./perf-tests/run-test.sh baseline --host 10.85.10.234
+#   ./perf-tests/run-test.sh streams --host 10.85.10.234
+#   ./perf-tests/run-test.sh federation-test --pub-host 10.85.10.234 --con-host 10.85.10.234
+#   ./perf-tests/run-test.sh baseline --host 10.85.10.234 --label "with-latency"
 #
 # TLS Examples:
-#   ./perf-tests/run-test.sh baseline --host 192.168.20.200 --truststore /path/to/truststore.p12
-#   ./perf-tests/run-test.sh streams --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/run-test.sh baseline --host 110.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/run-test.sh streams --host 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
 #
 # Federation Test (uses instance synchronization for separate producer/consumer hosts):
-#   ./perf-tests/run-test.sh federation-test --pub-host 192.168.20.200 --con-host 192.168.20.206
+#   ./perf-tests/run-test.sh federation-test --pub-host 10.85.10.234 --con-host 10.85.10.234
 # =============================================================================
 set -euo pipefail
 
