@@ -114,6 +114,7 @@ pki/
 ### 5. Deploy
 
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 ansible-playbook site.yml
 ```
 
@@ -142,6 +143,7 @@ This will:
 To remove RabbitMQ and revert changes on the nodes:
 
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 ansible-playbook playbooks/uninstall.yml
 ```
 
@@ -178,6 +180,7 @@ amqps://username:password@10.85.10.234:5671/
 curl -k -u admin:password https://10.85.10.234:15671/api/overview
 
 # Verify TLS configuration
+export ANSIBLE_CONFIG=./ansible.cfg
 ansible-playbook playbooks/verify_tls.yml
 ```
 
@@ -185,6 +188,7 @@ ansible-playbook playbooks/verify_tls.yml
 
 ### Automated TLS Testing
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 # Test complete warm standby replication over TLS
 ansible-playbook playbooks/verify_warm_standby_tls.yml
 ```
@@ -204,6 +208,7 @@ ansible-playbook playbooks/verify_warm_standby_tls.yml
 
 ### Health check
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 ansible-playbook playbooks/health_check.yml
 ```
 
@@ -231,6 +236,7 @@ ansible az-rmq-01,az-rmq-04,tx-rmq-01 -m command -a "rabbitmqctl change_password
 
 ### Re-run specific stage
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 # Re-configure federation
 ansible-playbook playbooks/configure_warm_standby.yml
 ```
@@ -243,6 +249,7 @@ If schema replication is stuck in `connecting` or `recover` state:
 
 Run the diagnostic playbook:
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 ansible-playbook playbooks/diagnose_schema_replication.yml
 ```
 
@@ -285,6 +292,7 @@ Causes:
 
 Fix - run the fix playbook:
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 ansible-playbook playbooks/fix_schema_replication.yml
 ```
 
@@ -366,6 +374,7 @@ rabbitmqctl schema_replication_status
 A test framework is included for validating throughput, latency, and replication under load. See [perf-tests/README.md](perf-tests/README.md) for full details.
 
 ```bash
+export ANSIBLE_CONFIG=./ansible.cfg
 # Install test tools
 ansible-playbook playbooks/install_perftest.yml
 
