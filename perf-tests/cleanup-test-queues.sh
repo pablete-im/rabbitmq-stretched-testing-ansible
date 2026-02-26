@@ -18,21 +18,22 @@
 set -euo pipefail
 
 # Cluster endpoints
-UPSTREAM_HOST="192.168.20.200"       # AZ-Cluster-1
-REGIONAL_STANDBY="192.168.20.203"    # AZ-Cluster-2
-CROSS_REGION_DR1="192.168.20.206"    # TX-Cluster-1
-CROSS_REGION_DR2="192.168.20.209"    # TX-Cluster-2
+UPSTREAM_HOST="10.85.10.234"       # AZ-Cluster-1
+REGIONAL_STANDBY="10.85.10.241"    # AZ-Cluster-2
+CROSS_REGION_DR1="10.85.10.244"    # TX-Cluster-1
+#CROSS_REGION_DR2="192.168.20.209"    # TX-Cluster-2
 
 USER="admin"
 PASSWORD=""
 DRY_RUN=false
 ALL_CLUSTERS=false
+INCLUDE_EXCHANGES=false
 PATTERN=""
 TRUSTSTORE=""
 TRUSTSTORE_PASS=""
 TRUSTSTORE_TYPE="JKS"
 
-# Test queue patterns to clean
+# Test queue/exchange patterns to clean
 TEST_PATTERNS=(
     "^core-test-"
     "^resiliency-"
@@ -41,21 +42,23 @@ TEST_PATTERNS=(
     "^promotion-test-"
     "^perf-test-"
     "^manual-test-"
+    "^fanout-test"
     "^baseline$"
 )
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --user)            USER="$2"; shift 2 ;;
-        --password)        PASSWORD="$2"; shift 2 ;;
-        --dry-run)         DRY_RUN=true; shift ;;
-        --all-clusters)    ALL_CLUSTERS=true; shift ;;
-        --pattern)         PATTERN="$2"; shift 2 ;;
-        --truststore)      TRUSTSTORE="$2"; shift 2 ;;
-        --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
-        --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
-        *)                 echo "Unknown option: $1"; exit 1 ;;
+        --user)              USER="$2"; shift 2 ;;
+        --password)          PASSWORD="$2"; shift 2 ;;
+        --dry-run)           DRY_RUN=true; shift ;;
+        --all-clusters)      ALL_CLUSTERS=true; shift ;;
+        --include-exchanges) INCLUDE_EXCHANGES=true; shift ;;
+        --pattern)           PATTERN="$2"; shift 2 ;;
+        --truststore)        TRUSTSTORE="$2"; shift 2 ;;
+        --truststore-pass)   TRUSTSTORE_PASS="$2"; shift 2 ;;
+        --truststore-type)   TRUSTSTORE_TYPE="$2"; shift 2 ;;
+        *)                   echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -81,15 +84,21 @@ fi
 # Build list of hosts to clean
 HOSTS=("$UPSTREAM_HOST")
 if $ALL_CLUSTERS; then
-    HOSTS+=("$REGIONAL_STANDBY" "$CROSS_REGION_DR1" "$CROSS_REGION_DR2")
+    #HOSTS+=("$REGIONAL_STANDBY" "$CROSS_REGION_DR1" "$CROSS_REGION_DR2")
+    HOSTS+=("$REGIONAL_STANDBY" "$CROSS_REGION_DR1" )
 fi
 
-# Function to check if queue name matches test patterns
-is_test_queue() {
+# Function to check if resource name matches test patterns
+is_test_resource() {
     local name="$1"
 
     # Skip internal RabbitMQ queues
     if [[ "$name" == rabbitmq.internal.* ]]; then
+        return 1
+    fi
+
+    # Skip internal exchanges
+    if [[ "$name" == amqp.* ]]; then
         return 1
     fi
 
@@ -118,20 +127,46 @@ delete_queue() {
     encoded_queue=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$queue', safe=''))")
 
     if $DRY_RUN; then
-        echo "  [DRY-RUN] Would delete: $queue"
+        echo "  [DRY-RUN] Would delete queue: $queue"
         return 0
     fi
 
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" -X DELETE \
+    status=$(curl -sf -k -o /dev/null -w "%{http_code}" -X DELETE \
         -u "${USER}:${PASSWORD}" \
         "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues/%2F/${encoded_queue}" 2>/dev/null || echo "000")
 
     if [[ "$status" == "204" ]] || [[ "$status" == "200" ]]; then
-        echo "  Deleted: $queue"
+        echo "  Deleted queue: $queue"
         return 0
     else
-        echo "  Failed to delete: $queue (HTTP $status)"
+        echo "  Failed to delete queue: $queue (HTTP $status)"
+        return 1
+    fi
+}
+
+# Function to delete an exchange
+delete_exchange() {
+    local host="$1"
+    local exchange="$2"
+    local encoded_exchange
+    encoded_exchange=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$exchange', safe=''))")
+
+    if $DRY_RUN; then
+        echo "  [DRY-RUN] Would delete exchange: $exchange"
+        return 0
+    fi
+
+    local status
+    status=$(curl -sf -k -o /dev/null -w "%{http_code}" -X DELETE \
+        -u "${USER}:${PASSWORD}" \
+        "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${encoded_exchange}" 2>/dev/null || echo "000")
+
+    if [[ "$status" == "204" ]] || [[ "$status" == "200" ]]; then
+        echo "  Deleted exchange: $exchange"
+        return 0
+    else
+        echo "  Failed to delete exchange: $exchange (HTTP $status)"
         return 1
     fi
 }
@@ -158,7 +193,7 @@ for host in "${HOSTS[@]}"; do
     echo "Checking $host..."
 
     # Get all queues
-    queues=$(curl -sf -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues" 2>/dev/null | \
+    queues=$(curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues" 2>/dev/null | \
         python3 -c "import sys,json; [print(q['name']) for q in json.load(sys.stdin)]" 2>/dev/null) || {
         echo "  Failed to connect to $host"
         continue
@@ -168,20 +203,44 @@ for host in "${HOSTS[@]}"; do
     while IFS= read -r queue; do
         [[ -z "$queue" ]] && continue
 
-        if is_test_queue "$queue"; then
+        if is_test_resource "$queue"; then
             if delete_queue "$host" "$queue"; then
-                ((host_deleted++))
-                ((total_deleted++))
+                ((host_deleted+=1))
+                ((total_deleted+=1))
             else
-                ((total_failed++))
+                ((total_failed+=1))
             fi
         fi
     done <<< "$queues"
 
+    if $INCLUDE_EXCHANGES; then
+        echo "  Scanning exchanges..."
+        exchanges=$(curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges" 2>/dev/null | \
+            python3 -c "import sys,json; [print(e['name']) for e in json.load(sys.stdin) if e['name']]" 2>/dev/null) || {
+            echo "  Failed to list exchanges on $host"
+        }
+
+        while IFS= read -r exchange; do
+            [[ -z "$exchange" ]] && continue
+            
+            # Skip internal exchanges
+            [[ "$exchange" == amqp.* ]] && continue
+
+            if is_test_resource "$exchange"; then
+                if delete_exchange "$host" "$exchange"; then
+                    ((host_deleted+=1))
+                    ((total_deleted+=1))
+                else
+                    ((total_failed+=1))
+                fi
+            fi
+        done <<< "$exchanges"
+    fi
+
     if [[ $host_deleted -eq 0 ]]; then
-        echo "  No test queues found"
+        echo "  No test queues or exchanges found"
     else
-        echo "  Cleaned $host_deleted queues"
+        echo "  Cleaned $host_deleted items"
     fi
     echo ""
 done
@@ -190,9 +249,9 @@ echo "=============================================="
 echo "  Summary"
 echo "=============================================="
 if $DRY_RUN; then
-    echo "  Would delete: $total_deleted queues"
+    echo "  Would delete: $total_deleted resources"
 else
-    echo "  Deleted: $total_deleted queues"
-    echo "  Failed: $total_failed queues"
+    echo "  Deleted: $total_deleted resources"
+    echo "  Failed: $total_failed resources"
 fi
 echo "=============================================="
