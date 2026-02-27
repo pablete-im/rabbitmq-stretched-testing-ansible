@@ -44,6 +44,9 @@ TEST_PATTERNS=(
     "^manual-test-"
     "^fanout-test"
     "^baseline$"
+    "^latency-sweep-"
+    "^wsr-stream-latency.*"
+    "^test-.*"
 )
 
 # Parse arguments

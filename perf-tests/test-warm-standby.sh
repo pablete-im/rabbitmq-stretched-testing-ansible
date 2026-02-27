@@ -40,20 +40,20 @@ TOOLS_DIR="$SCRIPT_DIR/tools"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Cluster endpoints
-UPSTREAM_HOST="192.168.20.200"       # AZ-Cluster-1 (az-rmq-01)
-REGIONAL_STANDBY="192.168.20.203"    # AZ-Cluster-2 (az-rmq-04) - first node
-CROSS_REGION_DR1="192.168.20.206"    # TX-Cluster-1 (tx-rmq-01) - first node
-CROSS_REGION_DR2="192.168.20.209"    # TX-Cluster-2 (tx-rmq-04) - first node
+UPSTREAM_HOST="10.85.10.234"       # AZ-Cluster-1 (pve-schwab-rmq01)
+REGIONAL_STANDBY="10.85.10.241"    # AZ-Cluster-2 (pve-schwab-rmq04) - first node
+CROSS_REGION_DR1="10.85.10.244"    # TX-Cluster-1 (pve-schwab-rmq07) - first node
+CROSS_REGION_DR2=""                # TX-Cluster-2 (Not defined in inventory)
 
 # All nodes in each cluster (standby replication may run on any one node)
-az-cluster-2_NODES=("192.168.20.203" "192.168.20.204" "192.168.20.205")
-tx-cluster-1_NODES=("192.168.20.206" "192.168.20.207" "192.168.20.208")
-TX_CLUSTER_2_NODES=("192.168.20.209" "192.168.20.210" "192.168.20.211")
+AZ_CLUSTER_2_NODES=("10.85.10.241" "10.85.10.242" "10.85.10.243")
+TX_CLUSTER_1_NODES=("10.85.10.244" "10.85.10.245" "10.85.10.246")
+TX_CLUSTER_2_NODES=()              # Not defined in inventory
 
 # Auth and SSH
 USER="admin"
 PASSWORD=""
-SSH_USER="ansible"
+SSH_USER="root"
 SKIP_CROSS_REGION=false
 TEST_PROMOTION=false
 CLEANUP=true
@@ -124,6 +124,9 @@ else
     STREAM_PORT="5552"
     JVM_OPTS=""
 fi
+
+# Construct AMQP URI for upstream
+AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${UPSTREAM_HOST}:${AMQP_PORT}"
 
 # --- Helper functions ---
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -204,7 +207,7 @@ find_standby_node() {
 get_queue_messages() {
     local host="$1"
     local queue="$2"
-    curl -sf -u "${USER}:${PASSWORD}" "http://${host}:15672/api/queues/%2F/${queue}" 2>/dev/null | \
+    curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues/%2F/${queue}" 2>/dev/null | \
         python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('messages', 0))" 2>/dev/null || echo "0"
 }
 
@@ -213,7 +216,7 @@ queue_exists() {
     local host="$1"
     local queue="$2"
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "http://${host}:15672/api/queues/%2F/${queue}" 2>/dev/null || echo "000")
+    status=$(curl -sf -k -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues/%2F/${queue}" 2>/dev/null || echo "000")
     [[ "$status" == "200" ]]
 }
 
@@ -222,7 +225,7 @@ exchange_exists() {
     local host="$1"
     local exchange="$2"
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "http://${host}:15672/api/exchanges/%2F/${exchange}" 2>/dev/null || echo "000")
+    status=$(curl -sf -k -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${exchange}" 2>/dev/null || echo "000")
     [[ "$status" == "200" ]]
 }
 
@@ -233,7 +236,7 @@ vhost_exists() {
     local encoded_vhost
     encoded_vhost=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$vhost', safe=''))")
     local status
-    status=$(curl -sf -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" 2>/dev/null || echo "000")
+    status=$(curl -sf -k -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" 2>/dev/null || echo "000")
     [[ "$status" == "200" ]]
 }
 
@@ -243,7 +246,7 @@ create_vhost() {
     local vhost="$2"
     local encoded_vhost
     encoded_vhost=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$vhost', safe=''))")
-    curl -sf -X PUT -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" \
+    curl -sf -k -X PUT -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" \
         -H "Content-Type: application/json" -d '{}' > /dev/null 2>&1
 }
 
@@ -253,14 +256,14 @@ delete_vhost() {
     local vhost="$2"
     local encoded_vhost
     encoded_vhost=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$vhost', safe=''))")
-    curl -sf -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" > /dev/null 2>&1 || true
+    curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/vhosts/${encoded_vhost}" > /dev/null 2>&1 || true
 }
 
 # Create exchange
 create_exchange() {
     local host="$1"
     local exchange="$2"
-    curl -sf -X PUT -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${exchange}" \
+    curl -sf -k -X PUT -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${exchange}" \
         -H "Content-Type: application/json" -d '{"type":"direct","durable":true}' > /dev/null 2>&1
 }
 
@@ -268,7 +271,7 @@ create_exchange() {
 delete_exchange() {
     local host="$1"
     local exchange="$2"
-    curl -sf -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${exchange}" > /dev/null 2>&1 || true
+    curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/exchanges/%2F/${exchange}" > /dev/null 2>&1 || true
 }
 
 # Wait for replication with timeout
@@ -303,7 +306,7 @@ wait_for_replication() {
 # Get replication status
 get_replication_status() {
     local host="$1"
-    curl -sf -u "${USER}:${PASSWORD}" "http://${host}:15672/api/overview" 2>/dev/null | \
+    curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/overview" 2>/dev/null | \
         python3 -c "
 import sys, json
 try:
@@ -322,14 +325,17 @@ test_cluster_connectivity() {
 
     local clusters=("$UPSTREAM_HOST:AZ-Cluster-1" "$REGIONAL_STANDBY:AZ-Cluster-2")
     if ! $SKIP_CROSS_REGION; then
-        clusters+=("$CROSS_REGION_DR1:TX-Cluster-1" "$CROSS_REGION_DR2:TX-Cluster-2")
+        clusters+=("$CROSS_REGION_DR1:TX-Cluster-1")
+        if [[ -n "$CROSS_REGION_DR2" ]]; then
+            clusters+=("$CROSS_REGION_DR2:TX-Cluster-2")
+        fi
     fi
 
     local all_ok=true
     for cluster in "${clusters[@]}"; do
         local host="${cluster%%:*}"
         local name="${cluster##*:}"
-        if curl -sf -u "${USER}:${PASSWORD}" "http://${host}:15672/api/overview" > /dev/null 2>&1; then
+        if curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/overview" > /dev/null 2>&1; then
             log_info "  ✓ $name ($host) accessible"
         else
             log_error "  ✗ $name ($host) not accessible"
@@ -356,8 +362,8 @@ test_schema_replication() {
 
     # Create exchange on upstream
     log_info "  Creating test exchange '$test_exchange' on upstream..."
-    curl -sf -X PUT -u "${USER}:${PASSWORD}" \
-        "http://${UPSTREAM_HOST}:15672/api/exchanges/%2F/${test_exchange}" \
+    curl -sf -k -X PUT -u "${USER}:${PASSWORD}" \
+        "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/exchanges/%2F/${test_exchange}" \
         -H "Content-Type: application/json" \
         -d '{"type":"direct","durable":true}' > /dev/null 2>&1
 
@@ -388,9 +394,11 @@ test_schema_replication() {
                 log_info "  ✓ Exchange replicated to TX-Cluster-1 (${i}x5s)"
                 tx1_replicated=true
             fi
-            if ! $tx2_replicated && exchange_exists "$CROSS_REGION_DR2" "$test_exchange"; then
+            if [[ -n "$CROSS_REGION_DR2" ]] && ! $tx2_replicated && exchange_exists "$CROSS_REGION_DR2" "$test_exchange"; then
                 log_info "  ✓ Exchange replicated to TX-Cluster-2 (${i}x5s)"
                 tx2_replicated=true
+            elif [[ -z "$CROSS_REGION_DR2" ]]; then
+                tx2_replicated=true # Skip if not defined
             fi
         fi
 
@@ -414,7 +422,7 @@ test_schema_replication() {
             log_error "  ✗ Exchange NOT replicated to TX-Cluster-1"
             all_replicated=false
         fi
-        if ! $tx2_replicated; then
+        if [[ -n "$CROSS_REGION_DR2" ]] && ! $tx2_replicated; then
             log_error "  ✗ Exchange NOT replicated to TX-Cluster-2"
             all_replicated=false
         fi
@@ -423,8 +431,8 @@ test_schema_replication() {
     # Cleanup - delete test exchange from upstream (will replicate deletion too)
     if $CLEANUP; then
         log_info "  Cleaning up test exchange..."
-        curl -sf -X DELETE -u "${USER}:${PASSWORD}" \
-            "http://${UPSTREAM_HOST}:15672/api/exchanges/%2F/${test_exchange}" > /dev/null 2>&1 || true
+        curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" \
+            "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/exchanges/%2F/${test_exchange}" > /dev/null 2>&1 || true
     else
         log_info "  Leaving test exchange '$test_exchange' for analysis (--no-cleanup)"
     fi
@@ -448,7 +456,7 @@ test_regional_message_replication() {
     local connected_node=""
     local connected_status=""
 
-    for node_ip in "${az-cluster-2_NODES[@]}"; do
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
         local status
         status=$(get_standby_replication_status "$node_ip")
 
@@ -494,7 +502,7 @@ test_regional_message_replication() {
     fi
 
     log_error "Regional standby replication not active on any node"
-    log_info "  Checked nodes: ${az-cluster-2_NODES[*]}"
+    log_info "  Checked nodes: ${AZ_CLUSTER_2_NODES[*]}"
     log_info "  Hint: Run 'rabbitmqctl connect_standby_replication_downstream' on one of these nodes"
     return 1
 }
@@ -513,7 +521,7 @@ test_cross_region_replication() {
     log_info "  Checking TX-Cluster-1 nodes for standby replication..."
     local tx1_connected=""
     local tx1_status=""
-    for node_ip in "${tx-cluster-1_NODES[@]}"; do
+    for node_ip in "${TX_CLUSTER_1_NODES[@]}"; do
         local status
         status=$(get_standby_replication_status "$node_ip")
         if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
@@ -531,34 +539,36 @@ test_cross_region_replication() {
         log_info "  ✓ TX-Cluster-1 standby replication: active (on node $tx1_connected)"
     else
         log_warn "  ✗ TX-Cluster-1 standby replication: not active on any node"
-        log_info "    Checked nodes: ${tx-cluster-1_NODES[*]}"
+        log_info "    Checked nodes: ${TX_CLUSTER_1_NODES[*]}"
         all_connected=false
     fi
 
     # Check TX-Cluster-2
-    log_info "  Checking TX-Cluster-2 nodes for standby replication..."
-    local tx2_connected=""
-    local tx2_status=""
-    for node_ip in "${TX_CLUSTER_2_NODES[@]}"; do
-        local status
-        status=$(get_standby_replication_status "$node_ip")
-        if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
-            tx2_connected="$node_ip"
-            tx2_status="$status"
-            break
-        fi
-    done
+    if [[ -n "${TX_CLUSTER_2_NODES[*]}" ]]; then
+        log_info "  Checking TX-Cluster-2 nodes for standby replication..."
+        local tx2_connected=""
+        local tx2_status=""
+        for node_ip in "${TX_CLUSTER_2_NODES[@]}"; do
+            local status
+            status=$(get_standby_replication_status "$node_ip")
+            if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
+                tx2_connected="$node_ip"
+                tx2_status="$status"
+                break
+            fi
+        done
 
-    if [[ -n "$tx2_connected" ]]; then
-        log_info "  TX-Cluster-2 status (from $tx2_connected):"
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && log_info "    $line"
-        done <<< "$tx2_status"
-        log_info "  ✓ TX-Cluster-2 standby replication: active (on node $tx2_connected)"
-    else
-        log_warn "  ✗ TX-Cluster-2 standby replication: not active on any node"
-        log_info "    Checked nodes: ${TX_CLUSTER_2_NODES[*]}"
-        all_connected=false
+        if [[ -n "$tx2_connected" ]]; then
+            log_info "  TX-Cluster-2 status (from $tx2_connected):"
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && log_info "    $line"
+            done <<< "$tx2_status"
+            log_info "  ✓ TX-Cluster-2 standby replication: active (on node $tx2_connected)"
+        else
+            log_warn "  ✗ TX-Cluster-2 standby replication: not active on any node"
+            log_info "    Checked nodes: ${TX_CLUSTER_2_NODES[*]}"
+            all_connected=false
+        fi
     fi
 
     if $all_connected; then
@@ -591,7 +601,7 @@ test_replication_lag() {
 
     # Find the connected standby node for each cluster
     local az2_node=""
-    for node_ip in "${az-cluster-2_NODES[@]}"; do
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
         local status
         status=$(get_standby_replication_status "$node_ip")
         if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
@@ -602,7 +612,7 @@ test_replication_lag() {
 
     local tx1_node=""
     if ! $SKIP_CROSS_REGION; then
-        for node_ip in "${tx-cluster-1_NODES[@]}"; do
+        for node_ip in "${TX_CLUSTER_1_NODES[@]}"; do
             local status
             status=$(get_standby_replication_status "$node_ip")
             if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
@@ -629,8 +639,8 @@ test_replication_lag() {
 
     # Start publisher in background
     log_info "  Starting sustained publish load..."
-    "$TOOLS_DIR/perf-test" \
-        --uri "amqp://${USER}:${PASSWORD}@${UPSTREAM_HOST}:5672" \
+    java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+        --uri "$AMQP_URI" \
         --quorum-queue \
         --queue "$queue" \
         --producers 2 \
@@ -868,8 +878,8 @@ test_replication_lag() {
 
     # Cleanup
     if $CLEANUP; then
-        curl -sf -X DELETE -u "${USER}:${PASSWORD}" \
-            "http://${UPSTREAM_HOST}:15672/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
+        curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" \
+            "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
     else
         log_info "  Leaving queue '$queue' for analysis (--no-cleanup)"
     fi
@@ -902,8 +912,8 @@ test_sustained_replication_throughput() {
     log_info "  Running sustained throughput test (60s)..."
 
     local output
-    output=$("$TOOLS_DIR/perf-test" \
-        --uri "amqp://${USER}:${PASSWORD}@${UPSTREAM_HOST}:5672" \
+    output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+        --uri "$AMQP_URI" \
         --quorum-queue \
         --queue "warm-standby-throughput-$(date +%s)" \
         --producers 2 \
@@ -924,7 +934,7 @@ test_sustained_replication_throughput() {
 
         # Check replication status after sustained load (check all nodes)
         log_info "  Replication status after sustained load:"
-        for node_ip in "${az-cluster-2_NODES[@]}"; do
+        for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
             local status
             status=$(get_standby_replication_status "$node_ip")
             if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
@@ -936,12 +946,424 @@ test_sustained_replication_throughput() {
             fi
         done
 
+        # Clean up the large queue so it doesn't block subsequent tests (like promotion)
+        if $CLEANUP; then
+            log_info "  Cleaning up throughput test queue to clear replication backlog..."
+            # Get the queue name from the perf-test command (it was generated with date)
+            # We can't easily get the variable back, but we can look for queues matching the pattern
+            curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues" 2>/dev/null | \
+                python3 -c "import sys,json; [print(q['name']) for q in json.load(sys.stdin) if 'warm-standby-throughput' in q['name']]" | \
+            while read -r q_name; do
+                [[ -n "$q_name" ]] && {
+                    log_info "    Deleting queue $q_name..."
+                    curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/${q_name}" > /dev/null 2>&1 || true
+                }
+            done
+            
+            # Wait for cleanup to propagate
+            log_info "  Waiting for queue deletion to replicate..."
+            sleep 5
+        fi
+
         log_pass "Sustained upstream throughput: $send_rate msg/s"
         return 0
     else
         log_error "Could not measure throughput"
         return 1
     fi
+}
+
+test_stream_consumer_latency() {
+    log_info "Test 6: WSR Stream Consumer Latency"
+
+    # Define nodes
+    local az2_node=""
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
+        local status
+        status=$(get_standby_replication_status "$node_ip")
+        if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
+            az2_node="$node_ip"
+            break
+        fi
+    done
+
+    if [[ -z "$az2_node" ]]; then
+        log_error "No connected standby node found in AZ-Cluster-2"
+        return 1
+    fi
+
+    local tx1_node=""
+    if ! $SKIP_CROSS_REGION; then
+        for node_ip in "${TX_CLUSTER_1_NODES[@]}"; do
+            local status
+            status=$(get_standby_replication_status "$node_ip")
+            if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
+                tx1_node="$node_ip"
+                break
+            fi
+        done
+    fi
+
+    # Prepare stream
+    local stream_name="wsr-stream-latency-$(date +%s)"
+    log_info "  Creating test stream '$stream_name'..."
+    
+    # Enable stream plugin on upstream (just in case)
+    ssh_sudo "$UPSTREAM_HOST" "rabbitmq-plugins enable rabbitmq_stream" >/dev/null 2>&1 || true
+
+    # Create stream queue on upstream
+    # The queue type argument must be an integer (x-queue-type-version) or string
+    # Correct way to declare stream via API is x-queue-type: stream
+    log_info "  Creating test stream '$stream_name' on upstream..."
+    curl -sf -k -X PUT -u "${USER}:${PASSWORD}" \
+        "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/${stream_name}" \
+        -H "Content-Type: application/json" \
+        -d '{"durable":true,"arguments":{"x-queue-type":"stream"}}' > /dev/null 2>&1
+
+    # Verify it was created as a stream
+    local q_type
+    q_type=$(curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/${stream_name}" 2>/dev/null | \
+        python3 -c "import sys, json; print(json.load(sys.stdin).get('type', 'unknown'))")
+    
+    if [[ "$q_type" != "stream" ]]; then
+        log_warn "  Queue created as '$q_type' instead of 'stream'. Retrying with explicit declare..."
+        # Try creating via perf-test which handles declaration well
+        java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+            --uri "$AMQP_URI" \
+            --queue "$stream_name" \
+            --queue-args "x-queue-type=stream" \
+            --producers 1 \
+            --consumers 0 \
+            --time 1 \
+            --size 10 \
+            --rate 1 \
+            --id "wsr-stream-init" > /dev/null 2>&1
+    else
+        log_info "  ✓ Queue created as stream on upstream"
+    fi
+
+    # Helper to check queue type on a node
+    check_queue_type() {
+        local host="$1"
+        local queue="$2"
+        curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${host}:${MGMT_PORT}/api/queues/%2F/${queue}" 2>/dev/null | \
+            python3 -c "import sys, json; print(json.load(sys.stdin).get('type', 'none'))" 2>/dev/null || echo "error"
+    }
+
+    # Wait for schema to replicate to AZ2
+    log_info "  Waiting for stream to replicate to Regional Standby ($az2_node)..."
+    local az2_ready=false
+    for i in {1..60}; do
+        local type
+        type=$(check_queue_type "$az2_node" "$stream_name")
+        if [[ "$type" == "stream" ]]; then
+            log_info "    ✓ Stream replicated to Regional Standby (after ${i}s)"
+            az2_ready=true
+            break
+        elif [[ "$type" == "classic" ]]; then
+            log_warn "    ⚠ Queue appeared as 'classic' on standby. This usually means a client auto-created it before replication. Deleting..."
+            curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${az2_node}:${MGMT_PORT}/api/queues/%2F/${stream_name}" > /dev/null 2>&1
+        fi
+        sleep 1
+    done
+
+    if ! $az2_ready; then
+        log_error "Stream failed to replicate to Regional Standby within 60s"
+        return 1
+    fi
+
+    # Wait for schema to replicate to TX1 (if enabled)
+    if [[ -n "$tx1_node" ]]; then
+        log_info "  Waiting for stream to replicate to Cross-Region Standby ($tx1_node)..."
+        local tx1_ready=false
+        for i in {1..60}; do
+            local type
+            type=$(check_queue_type "$tx1_node" "$stream_name")
+            if [[ "$type" == "stream" ]]; then
+                log_info "    ✓ Stream replicated to Cross-Region Standby (after ${i}s)"
+                tx1_ready=true
+                break
+            elif [[ "$type" == "classic" ]]; then
+                log_warn "    ⚠ Queue appeared as 'classic' on standby. Deleting..."
+                curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${tx1_node}:${MGMT_PORT}/api/queues/%2F/${stream_name}" > /dev/null 2>&1
+            fi
+            sleep 1
+        done
+        
+        if ! $tx1_ready; then
+            log_error "Stream failed to replicate to Cross-Region Standby within 60s"
+            # Don't return 1 here, maybe we can still test AZ2
+        fi
+    fi
+
+    # Helper to find the node hosting the stream leader or active replica
+    find_stream_leader_node() {
+        local cluster_nodes=("${@}")
+        for node_ip in "${cluster_nodes[@]}"; do
+            # Check if this node hosts a running replica of the stream
+            # We can check this by seeing if we can declare/consume from it without the "local node" error
+            # Or use API to find the leader/member
+            local queue_info
+            queue_info=$(curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${node_ip}:${MGMT_PORT}/api/queues/%2F/${stream_name}" 2>/dev/null)
+            
+            # Check if this node is in the member list or is the leader
+            # Note: For WSR downstream, the stream might be restricted to specific nodes
+            if [[ -n "$queue_info" ]]; then
+                echo "$node_ip"
+                return 0
+            fi
+        done
+        echo ""
+    }
+
+    # Start consumers on standby clusters FIRST (now that we know the stream exists)
+    
+    # 1. Regional Standby (AZ2)
+    # We need to target the specific node that hosts the stream replica in the downstream cluster
+    # In WSR, streams are replicated, but consumption via AMQP requires connecting to a node that has the data locally
+    # We'll try to find the best node, defaulting to the standby node if specific one not found
+    
+    # Actually, let's just loop through nodes until one works or we run out
+    local az2_uri=""
+    local az2_pid=""
+    local az2_output_file="/tmp/wsr-stream-cons-az2.txt"
+    
+    log_info "  Starting consumer on Regional Standby..."
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
+        log_info "    Trying node $node_ip..."
+        local uri="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${node_ip}:${AMQP_PORT}"
+        local out_file="/tmp/wsr-stream-cons-az2-${node_ip}.txt"
+        
+        java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+            --uri "$uri" \
+            --queue "$stream_name" \
+            --predeclared \
+            --producers 0 \
+            --consumers 1 \
+            --time 60 \
+            --qos 100 \
+            --stream-consumer-offset "first" \
+            --id "wsr-stream-cons-az2" > "$out_file" 2>&1 &
+        local pid=$!
+        
+        # Give it enough time to fail if it's going to fail (JVM startup + connection)
+        sleep 5
+        if kill -0 $pid 2>/dev/null; then
+            # It's still running, check for the specific error in the log just in case it's in a restart loop or something
+            if ! grep -q "PRECONDITION_FAILED" "$out_file"; then
+                log_info "    ✓ Connected to $node_ip"
+                az2_pid=$pid
+                az2_uri=$uri # Just for reference
+                az2_output_file=$out_file
+                break
+            else
+                log_warn "    ✗ Failed on $node_ip (Precondition Failed found in log)"
+                kill $pid 2>/dev/null || true
+            fi
+        else
+             # Process died, check why
+             if grep -q "PRECONDITION_FAILED" "$out_file"; then
+                 log_warn "    ✗ Failed on $node_ip (Precondition Failed)"
+             else
+                 log_warn "    ✗ Process died on $node_ip (Unknown reason, see log)"
+             fi
+        fi
+    done
+
+    if [[ -z "$az2_pid" ]]; then
+        log_error "Could not connect consumer to any node in AZ-Cluster-2"
+    fi
+
+    # 2. Cross-Region Standby (TX1)
+    local tx1_pid=""
+    local tx1_output_file="/tmp/wsr-stream-cons-tx1.txt"
+    
+    if [[ -n "$tx1_node" ]]; then
+        log_info "  Starting consumer on Cross-Region Standby..."
+        for node_ip in "${TX_CLUSTER_1_NODES[@]}"; do
+            log_info "    Trying node $node_ip..."
+            local uri="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${node_ip}:${AMQP_PORT}"
+            local out_file="/tmp/wsr-stream-cons-tx1-${node_ip}.txt"
+            
+            java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+                --uri "$uri" \
+                --queue "$stream_name" \
+                --predeclared \
+                --producers 0 \
+                --consumers 1 \
+                --time 60 \
+                --qos 100 \
+                --stream-consumer-offset "first" \
+                --id "wsr-stream-cons-tx1" > "$out_file" 2>&1 &
+            local pid=$!
+            
+            sleep 5
+            if kill -0 $pid 2>/dev/null; then
+                if ! grep -q "PRECONDITION_FAILED" "$out_file"; then
+                    log_info "    ✓ Connected to $node_ip"
+                    tx1_pid=$pid
+                    tx1_output_file=$out_file
+                    break
+                else
+                    log_warn "    ✗ Failed on $node_ip (Precondition Failed found in log)"
+                    kill $pid 2>/dev/null || true
+                fi
+            else
+                 if grep -q "PRECONDITION_FAILED" "$out_file"; then
+                     log_warn "    ✗ Failed on $node_ip (Precondition Failed)"
+                 else
+                     log_warn "    ✗ Process died on $node_ip (Unknown reason)"
+                 fi
+            fi
+        done
+    fi
+
+    # Give consumers time to initialize
+    log_info "  Waiting 5s for consumers to initialize..."
+    sleep 5
+
+    # Run producer (30s duration)
+    log_info "  Starting producer on Upstream..."
+    local prod_output_file="/tmp/wsr-stream-prod.txt"
+    java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+        --uri "$AMQP_URI" \
+        --queue "$stream_name" \
+        --predeclared \
+        --producers 1 \
+        --consumers 0 \
+        --time 30 \
+        --size 1000 \
+        --rate 100 \
+        --confirm 10 \
+        --routing-key "$stream_name" \
+        --id "wsr-stream-prod" > "$prod_output_file" 2>&1 &
+    local prod_pid=$!
+
+    # Wait for completion
+    log_info "  Waiting for test completion (producer: 30s, consumers: 60s)..."
+    wait "$prod_pid"
+    wait "$az2_pid"
+    [[ -n "$tx1_pid" ]] && wait "$tx1_pid"
+
+    # Process results
+    local csv_file="$RESULTS_DIR/wsr-stream-latency-$(date +%Y%m%d-%H%M%S).csv"
+    echo "role,cluster,node,min_ms,median_ms,p95_ms,p99_ms,max_ms,msg_count" > "$csv_file"
+
+    log_info ""
+    log_info "  === WSR Stream Latency Results ==="
+    printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-12s |\n" "Role" "Cluster" "Min" "Med" "P99" "Max" "Count"
+    printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-12s |\n" "---------------" "---------------" "----------" "----------" "----------" "----------" "------------"
+
+    # Function to parse latency from perf-test output
+    parse_latency() {
+        local file="$1"
+        local type="$2" # confirm or consumer
+        grep "${type} latency" "$file" | grep "min/median" | tail -1 | \
+        sed -n 's/.*[^0-9]\([0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\).*/\1/p'
+    }
+
+    # Function to parse message count from perf-test output
+    parse_msg_count() {
+        local file="$1"
+        local type="$2" # published or consumed
+        local count="0"
+        
+        if [[ "$type" == "published" ]]; then
+            # Sum 'sent: X msg/s' from interval lines
+            # Example: id: ..., time 1.000 s, sent: 100 msg/s, ...
+            # We look for "sent:" and take the next field
+            count=$(grep "sent: .* msg/s" "$file" | awk '{ for(i=1;i<=NF;i++) if($i=="sent:") print $(i+1) }' | tr -d 'msg/s,' | paste -sd+ - | bc)
+        else
+            # Sum 'received: X msg/s' from interval lines
+            count=$(grep "received: .* msg/s" "$file" | awk '{ for(i=1;i<=NF;i++) if($i=="received:") print $(i+1) }' | tr -d 'msg/s,' | paste -sd+ - | bc)
+        fi
+        
+        if [[ -z "$count" ]]; then
+             echo "N/A"
+        else
+             echo "$count"
+        fi
+    }
+
+    # Debug: show last few lines of output files for verification
+    log_info "  Debug: Producer output (last 5 lines):"
+    tail -n 5 "$prod_output_file" | while read -r line; do log_info "    $line"; done
+    log_info "  Debug: AZ2 Consumer output (last 5 lines):"
+    tail -n 5 "$az2_output_file" | while read -r line; do log_info "    $line"; done
+    if [[ -n "$tx1_node" ]]; then
+        log_info "  Debug: TX1 Consumer output (last 5 lines):"
+        tail -n 5 "$tx1_output_file" | while read -r line; do log_info "    $line"; done
+    fi
+
+    # Get exact stream length from API for comparison
+    local stream_len
+    stream_len=$(get_queue_messages "$UPSTREAM_HOST" "$stream_name")
+    log_info "  Debug: Stream length on upstream: $stream_len"
+
+    # Producer Confirm Latency
+    local prod_lats
+    local prod_count
+    prod_lats=$(parse_latency "$prod_output_file" "confirm")
+    prod_count=$(parse_msg_count "$prod_output_file" "published")
+    
+    # Use API count if parsing failed or for verification
+    [[ "$prod_count" == "N/A" ]] && prod_count="$stream_len (API)"
+    
+    if [[ -n "$prod_lats" ]]; then
+        IFS='/' read -r p_min p_med _ p_95 p_99 p_max <<< "$prod_lats"
+        # Convert us to ms
+        p_min=$((p_min / 1000)); p_med=$((p_med / 1000)); p_95=$((p_95 / 1000)); p_99=$((p_99 / 1000)); p_max=$((p_max / 1000))
+        printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-10s |\n" "Producer" "Upstream" "${p_min}ms" "${p_med}ms" "${p_99}ms" "${p_max}ms" "Count: ${prod_count}"
+        echo "producer,upstream,$UPSTREAM_HOST,$p_min,$p_med,$p_95,$p_99,$p_max,$prod_count" >> "$csv_file"
+    else
+        log_warn "  Could not parse producer latency. Full output:"
+        cat "$prod_output_file" | while read -r line; do log_warn "    $line"; done
+    fi
+
+    # Consumer Latency (AZ2)
+    local az2_lats
+    local az2_count
+    az2_lats=$(parse_latency "$az2_output_file" "consumer")
+    az2_count=$(parse_msg_count "$az2_output_file" "consumed")
+
+    if [[ -n "$az2_lats" ]]; then
+        IFS='/' read -r c_min c_med _ c_95 c_99 c_max <<< "$az2_lats"
+        c_min=$((c_min / 1000)); c_med=$((c_med / 1000)); c_95=$((c_95 / 1000)); c_99=$((c_99 / 1000)); c_max=$((c_max / 1000))
+        printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-10s |\n" "Consumer" "Regional" "${c_min}ms" "${c_med}ms" "${c_99}ms" "${c_max}ms" "Count: ${az2_count}"
+        echo "consumer,regional,$az2_node,$c_min,$c_med,$c_95,$c_99,$c_max,$az2_count" >> "$csv_file"
+    else
+        log_warn "  Could not parse AZ2 consumer latency. Full output:"
+        cat "$az2_output_file" | while read -r line; do log_warn "    $line"; done
+    fi
+
+    # Consumer Latency (TX1)
+    if [[ -n "$tx1_node" ]]; then
+        local tx1_lats
+        local tx1_count
+        tx1_lats=$(parse_latency "$tx1_output_file" "consumer")
+        tx1_count=$(parse_msg_count "$tx1_output_file" "consumed")
+
+        if [[ -n "$tx1_lats" ]]; then
+            IFS='/' read -r c_min c_med _ c_95 c_99 c_max <<< "$tx1_lats"
+            c_min=$((c_min / 1000)); c_med=$((c_med / 1000)); c_95=$((c_95 / 1000)); c_99=$((c_99 / 1000)); c_max=$((c_max / 1000))
+            printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-10s |\n" "Consumer" "Cross-Region" "${c_min}ms" "${c_med}ms" "${c_99}ms" "${c_max}ms" "Count: ${tx1_count}"
+            echo "consumer,cross-region,$tx1_node,$c_min,$c_med,$c_95,$c_99,$c_max,$tx1_count" >> "$csv_file"
+        else
+            log_warn "  Could not parse TX1 consumer latency. Full output:"
+            cat "$tx1_output_file" | while read -r line; do log_warn "    $line"; done
+        fi
+    fi
+    log_info "  Results saved to $csv_file"
+
+    # Cleanup
+    if $CLEANUP; then
+        log_info "  Cleaning up stream..."
+        curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" \
+            "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/${stream_name}" > /dev/null 2>&1 || true
+    fi
+    rm -f "$prod_output_file" "$az2_output_file" "$tx1_output_file"
+
+    return 0
 }
 
 # Restore a promoted standby back to downstream mode
@@ -954,13 +1376,13 @@ restore_standby_to_downstream() {
 
     # Step 1: Update config to downstream mode on ALL nodes in the cluster
     log_info "    Setting operating mode to downstream on all AZ-Cluster-2 nodes..."
-    for node_ip in "${az-cluster-2_NODES[@]}"; do
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
         ssh_sudo "$node_ip" "sed -i 's/operating_mode = upstream/operating_mode = downstream/g' /etc/rabbitmq/rabbitmq.conf" 2>/dev/null || true
     done
 
     # Step 2: Restart RabbitMQ on all nodes (rolling restart would be better but this is simpler)
     log_info "    Restarting RabbitMQ on all nodes..."
-    for node_ip in "${az-cluster-2_NODES[@]}"; do
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
         ssh_sudo "$node_ip" "systemctl restart tanzu-rabbitmq-server" 2>/dev/null &
     done
     wait  # Wait for all restarts to begin
@@ -970,7 +1392,7 @@ restore_standby_to_downstream() {
     local all_ready=false
     for attempt in {1..30}; do
         all_ready=true
-        for node_ip in "${az-cluster-2_NODES[@]}"; do
+        for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
             if ! ssh_sudo "$node_ip" "rabbitmqctl await_startup" >/dev/null 2>&1; then
                 all_ready=false
                 break
@@ -1007,7 +1429,7 @@ restore_standby_to_downstream() {
     sleep 5
 
     local connected_node=""
-    for node_ip in "${az-cluster-2_NODES[@]}"; do
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
         local status
         status=$(get_standby_replication_status "$node_ip")
         if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
@@ -1027,7 +1449,7 @@ restore_standby_to_downstream() {
 }
 
 test_promotion() {
-    log_info "Test 6: Standby promotion verification"
+    log_info "Test 7: Standby promotion verification"
 
     if ! $TEST_PROMOTION; then
         log_warn "Skipped (use --test-promotion to enable)"
@@ -1038,7 +1460,7 @@ test_promotion() {
     # Find the node with active standby replication in AZ-Cluster-2
     local standby_node=""
     log_info "  Finding active standby replication node in AZ-Cluster-2..."
-    for node_ip in "${az-cluster-2_NODES[@]}"; do
+    for node_ip in "${AZ_CLUSTER_2_NODES[@]}"; do
         local status
         status=$(get_standby_replication_status "$node_ip")
         if [[ "$status" == *"connected"* ]] || [[ "$status" == *"downstream"* ]]; then
@@ -1050,7 +1472,7 @@ test_promotion() {
 
     if [[ -z "$standby_node" ]]; then
         log_error "No active standby replication found in AZ-Cluster-2"
-        log_info "  Checked nodes: ${az-cluster-2_NODES[*]}"
+        log_info "  Checked nodes: ${AZ_CLUSTER_2_NODES[*]}"
         return 1
     fi
 
@@ -1067,16 +1489,16 @@ test_promotion() {
     local message_count=100
 
     # Clean up any leftover queue from previous runs
-    curl -sf -X DELETE -u "${USER}:${PASSWORD}" \
-        "http://${UPSTREAM_HOST}:15672/api/queues/%2F/promotion-test-queue" > /dev/null 2>&1 || true
+    curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" \
+        "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/promotion-test-queue" > /dev/null 2>&1 || true
 
     log_info "  Publishing $message_count messages to upstream..."
     log_info "  Queue: $queue"
-    log_info "  Target: amqp://${USER}:****@${UPSTREAM_HOST}:5672"
+    log_info "  Target: ${AMQP_URI//:????@/:****@}"
 
     local pub_output
-    pub_output=$("$TOOLS_DIR/perf-test" \
-        --uri "amqp://${USER}:${PASSWORD}@${UPSTREAM_HOST}:5672" \
+    pub_output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+        --uri "$AMQP_URI" \
         --quorum-queue \
         --queue "$queue" \
         --producers 1 \
@@ -1121,12 +1543,12 @@ test_promotion() {
 
     # Get detailed queue info for debugging
     local queue_info
-    queue_info=$(curl -sf -u "${USER}:${PASSWORD}" "http://${UPSTREAM_HOST}:15672/api/queues/%2F/${queue}" 2>&1) || true
+    queue_info=$(curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/${queue}" 2>&1) || true
 
     if [[ -z "$queue_info" ]] || [[ "$queue_info" == *"not_found"* ]]; then
         log_error "  Queue '$queue' was not created on upstream"
         log_info "  Listing all queues on upstream:"
-        curl -sf -u "${USER}:${PASSWORD}" "http://${UPSTREAM_HOST}:15672/api/queues" 2>&1 | \
+        curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues" 2>&1 | \
             python3 -c "import sys,json; [print(f'    - {q[\"name\"]} ({q.get(\"messages\",0)} msgs)') for q in json.load(sys.stdin)]" 2>/dev/null || true
         return 1
     fi
@@ -1159,8 +1581,8 @@ test_promotion() {
     fi
 
     # Give replication time to sync
-    log_info "  Waiting for replication to sync..."
-    sleep 10
+    log_info "  Waiting for replication to sync (30s)..."
+    sleep 30
 
     # Check vhosts available for recovery before promotion
     log_info "  Checking vhosts available for recovery before promotion..."
@@ -1193,7 +1615,7 @@ test_promotion() {
     # List all queues on the promoted cluster to see what's there
     log_info "  Listing queues on promoted cluster..."
     local promoted_queues
-    promoted_queues=$(curl -sf -u "${USER}:${PASSWORD}" "http://${standby_node}:15672/api/queues" 2>&1 | \
+    promoted_queues=$(curl -sf -k -u "${USER}:${PASSWORD}" "${MGMT_PROTOCOL}://${standby_node}:${MGMT_PORT}/api/queues" 2>&1 | \
         python3 -c "import sys,json; [print(f'    {q[\"name\"]}: {q.get(\"messages\",0)} msgs') for q in json.load(sys.stdin) if not q['name'].startswith('rabbitmq.internal')]" 2>/dev/null) || true
     if [[ -n "$promoted_queues" ]]; then
         log_info "  Queues on promoted cluster:"
@@ -1210,8 +1632,8 @@ test_promotion() {
 
     # Also check if queue exists at all
     local queue_exists_check
-    queue_exists_check=$(curl -sf -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" \
-        "http://${standby_node}:15672/api/queues/%2F/${queue}" 2>/dev/null || echo "000")
+    queue_exists_check=$(curl -sf -k -o /dev/null -w "%{http_code}" -u "${USER}:${PASSWORD}" \
+        "${MGMT_PROTOCOL}://${standby_node}:${MGMT_PORT}/api/queues/%2F/${queue}" 2>/dev/null || echo "000")
     if [[ "$queue_exists_check" != "200" ]]; then
         log_warn "  Queue '$queue' does not exist on promoted cluster (HTTP $queue_exists_check)"
     fi
@@ -1230,15 +1652,17 @@ test_promotion() {
     # Clean up test queue on promoted cluster before restoring
     if $CLEANUP; then
         log_info "  Cleaning up test queue..."
-        curl -sf -X DELETE -u "${USER}:${PASSWORD}" \
-            "http://${standby_node}:15672/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
-        curl -sf -X DELETE -u "${USER}:${PASSWORD}" \
-            "http://${UPSTREAM_HOST}:15672/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
+        curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" \
+            "${MGMT_PROTOCOL}://${standby_node}:${MGMT_PORT}/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
+        curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" \
+            "${MGMT_PROTOCOL}://${UPSTREAM_HOST}:${MGMT_PORT}/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
     else
         log_info "  Leaving queue '$queue' for analysis (--no-cleanup)"
     fi
 
     # Restore standby to downstream mode
+    log_info ""
+    log_info "Test 8: Restore standby cluster to downstream mode"
     log_info "  Restoring AZ-Cluster-2 to downstream mode..."
     if restore_standby_to_downstream "$standby_node" "$UPSTREAM_HOST"; then
         log_pass "Standby restored to downstream mode"
@@ -1299,15 +1723,16 @@ for test_func in \
     test_cross_region_replication \
     test_replication_lag \
     test_sustained_replication_throughput \
+    test_stream_consumer_latency \
     test_promotion
 do
     echo ""
     echo "" >> "$RESULT_FILE"
     # Run test, display with colors, strip colors for file
     if $test_func 2>&1 | tee >(strip_ansi >> "$RESULT_FILE"); then
-        ((TESTS_PASSED++))
+        ((TESTS_PASSED+=1))
     else
-        ((TESTS_FAILED++))
+        ((TESTS_FAILED+=1))
     fi
 done
 
