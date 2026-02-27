@@ -28,10 +28,10 @@ TOOLS_DIR="$SCRIPT_DIR/tools"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Defaults
-HOST="192.168.20.200"
+HOST="10.85.10.234"
 USER="admin"
 PASSWORD=""
-SSH_USER="ansible"
+SSH_USER="root"
 QUICK_MODE=false
 TEST_DURATION=60
 RESTORE_LATENCY=true
@@ -46,9 +46,9 @@ LATENCY_VALUES=(0 1 2 3 5 10 15 20 35 50)
 QUICK_LATENCY_VALUES=(0 3 10 35)
 
 # Cluster nodes to configure latency on
-NODE1_HOST="192.168.20.200"  # az-rmq-01
-NODE2_HOST="192.168.20.201"  # az-rmq-02
-NODE3_HOST="192.168.20.202"  # az-rmq-03
+NODE1_HOST="10.85.10.234"  # az-rmq-01
+NODE2_HOST="10.85.10.235"  # az-rmq-02
+NODE3_HOST="10.85.10.236"  # az-rmq-03
 
 # Colors for terminal output (disabled when piped/redirected)
 if [[ -t 1 ]]; then
@@ -114,6 +114,9 @@ fi
 
 AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${AMQP_PORT}"
 
+# Store initial configuration
+declare -A INITIAL_LATENCY_CONFIG
+
 # --- Helper functions ---
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -132,31 +135,95 @@ ssh_sudo() {
     ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${SSH_USER}@${host}" "sudo $cmd" 2>/dev/null
 }
 
-# Get network interface name on remote host
+# Execute command on remote node via SSH (no sudo)
+ssh_cmd() {
+    local host="$1"
+    local cmd="$2"
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${SSH_USER}@${host}" "$cmd" 2>/dev/null
+}
+
+# Get network interface name on remote host (prefer ens33)
 get_interface() {
     local host="$1"
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${SSH_USER}@${host}" \
-        "ip route get 8.8.8.8 | sed -n 's/.*dev \([^ ]*\).*/\1/p'" 2>/dev/null || echo "ens192"
+    if ssh_cmd "$host" "ip link show ens33 >/dev/null 2>&1"; then
+        echo "ens33"
+    else
+        ssh_cmd "$host" "ip route get 8.8.8.8 | sed -n 's/.*dev \([^ ]*\).*/\1/p'" 2>/dev/null || echo "eth0"
+    fi
+}
+
+# Capture initial latency state from nodes
+save_initial_state() {
+    log_info "Capturing initial latency configuration..."
+    for node in "$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST"; do
+        local iface
+        iface=$(get_interface "$node")
+        
+        local tc_show
+        tc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
+        
+        # Extract Band 20 delay params (e.g., "delay 1.5ms 500us")
+        local params=""
+        # Search for line containing "parent 1:2" (Band 20)
+        local band_line
+        band_line=$(echo "$tc_show" | grep "parent 1:2")
+        
+        if [[ -n "$band_line" ]]; then
+             params=$(echo "$band_line" | grep -oP 'delay [0-9.]+(ms|us)(\s+[0-9.]+(ms|us))?')
+        fi
+        
+        if [[ -n "$params" ]]; then
+            INITIAL_LATENCY_CONFIG["$node"]="$params"
+            log_info "  Node $node: Detected initial config '$params' on $iface"
+        else
+            INITIAL_LATENCY_CONFIG["$node"]="NONE"
+            log_info "  Node $node: No existing Band 20 config on $iface"
+        fi
+    done
 }
 
 # Configure uniform latency between all cluster nodes
 configure_latency() {
     local delay_ms="$1"
-    local jitter_ms=$((delay_ms / 3 + 1))  # Jitter is ~1/3 of delay, minimum 1ms
+    local jitter_ms=$((delay_ms / 10))  # Minimal jitter for sweep accuracy
+    [[ $jitter_ms -lt 1 ]] && jitter_ms=0 # 0ms jitter for very low latency tests
 
     log_info "Configuring ${delay_ms}ms latency (jitter: ${jitter_ms}ms)..."
 
     for node_host in "$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST"; do
         local iface
         iface=$(get_interface "$node_host")
+        local initial="${INITIAL_LATENCY_CONFIG[$node_host]}"
 
-        # Clear existing rules
-        ssh_sudo "$node_host" "tc qdisc del dev $iface root 2>/dev/null || true"
-
-        if [[ "$delay_ms" -gt 0 ]]; then
-            # Add latency to all outgoing traffic (simplified - adds to everything)
-            ssh_sudo "$node_host" "tc qdisc add dev $iface root netem delay ${delay_ms}ms ${jitter_ms}ms distribution normal"
+        if [[ "$initial" != "NONE" ]]; then
+            # Modify existing Band 20 (Metro Latency)
+            local dist_param=""
+            if [[ "$jitter_ms" -gt 0 ]]; then
+                dist_param="distribution normal"
+            fi
+            
+            local out
+            out=$(ssh_sudo "$node_host" "tc qdisc change dev $iface parent 1:2 handle 20: netem delay ${delay_ms}ms ${jitter_ms}ms $dist_param 2>&1")
+            
+            if [[ $? -ne 0 ]]; then
+                log_error "Failed to update Band 20 on $node_host: $out"
+            fi
+        else
+            # Fallback: Clean root and add fresh rule
+            ssh_sudo "$node_host" "tc qdisc del dev $iface root 2>/dev/null || true"
+            if [[ "$delay_ms" -gt 0 ]]; then
+                local dist_param=""
+                if [[ "$jitter_ms" -gt 0 ]]; then
+                    dist_param="distribution normal"
+                fi
+                ssh_sudo "$node_host" "tc qdisc add dev $iface root netem delay ${delay_ms}ms ${jitter_ms}ms $dist_param"
+            fi
         fi
+        
+        # Verify
+        local verify
+        verify=$(ssh_cmd "$node_host" "tc qdisc show dev $iface | grep -E 'netem 20:|root netem'")
+        log_info "  $node_host applied: $verify"
     done
 
     # Allow network to stabilize
@@ -165,29 +232,52 @@ configure_latency() {
     log_pass "Latency configured: ${delay_ms}ms"
 }
 
-# Clear all latency configuration
+# Clear all latency configuration (reset to 0ms)
 clear_latency() {
     log_info "Clearing latency configuration..."
 
     for node_host in "$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST"; do
         local iface
         iface=$(get_interface "$node_host")
-        ssh_sudo "$node_host" "tc qdisc del dev $iface root 2>/dev/null || true"
+        local initial="${INITIAL_LATENCY_CONFIG[$node_host]}"
+
+        if [[ "$initial" != "NONE" ]]; then
+            # Reset Band 20 to 0ms
+            ssh_sudo "$node_host" "tc qdisc change dev $iface parent 1:2 handle 20: netem delay 0ms 0ms" || true
+        else
+            # Remove root rule
+            ssh_sudo "$node_host" "tc qdisc del dev $iface root 2>/dev/null || true"
+        fi
     done
 
     sleep 2
-    log_pass "Latency cleared"
+    log_pass "Latency cleared (0ms)"
 }
 
-# Restore original latency configuration via Ansible playbook
+# Restore original latency configuration
 restore_latency() {
-    log_info "Restoring original latency configuration via Ansible..."
+    log_info "Restoring original latency configuration..."
 
-    if ! ansible-playbook -i "$PROJECT_DIR/inventory/hosts.yml" "$PROJECT_DIR/playbooks/configure_latency.yml" > /dev/null 2>&1; then
-        log_error "Failed to restore latency configuration!"
-        log_warn "Run manually: ansible-playbook -i inventory/hosts.yml playbooks/configure_latency.yml"
-        return 1
-    fi
+    for node_host in "$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST"; do
+        local iface
+        iface=$(get_interface "$node_host")
+        local initial="${INITIAL_LATENCY_CONFIG[$node_host]}"
+
+        if [[ "$initial" != "NONE" ]]; then
+            log_info "  Restoring $node_host to: $initial"
+            # Restore original parameters to Band 20
+            ssh_sudo "$node_host" "tc qdisc change dev $iface parent 1:2 handle 20: netem $initial" || \
+                log_error "Failed to restore config on $node_host"
+        else
+            log_info "  Restoring $node_host to clean state"
+            ssh_sudo "$node_host" "tc qdisc del dev $iface root 2>/dev/null || true"
+        fi
+        
+        # Verify
+        local verify
+        verify=$(ssh_cmd "$node_host" "tc qdisc show dev $iface | grep -E 'netem 20:|root netem'")
+        log_info "  $node_host restored: $verify"
+    done
 
     log_pass "Original latency configuration restored"
 }
@@ -224,32 +314,32 @@ run_perf_test() {
     send_rate="${send_rate:-0}"
     recv_rate="${recv_rate:-0}"
 
-    # Parse confirm latency from "min/median/75th/95th/99th/max 123/456/789/..." format
-    # Example: "confirm latency min/median/75th/95th/99th/max 26376/45057/52783/72707/98042/209587 µs"
-    # Note: Using confirm latency (time to broker ack) instead of consumer latency
-    #       because consumer latency reports 0 when artificial network latency is added
-    local latency_line
-    latency_line=$(echo "$output" | grep "confirm latency" | grep "min/median" | \
+    # Parse confirm latency
+    local confirm_lat_line
+    confirm_lat_line=$(echo "$output" | grep "confirm latency" | grep "min/median" | \
         sed -n 's/.*[^0-9]\([0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\).*/\1/p' | tail -1)
 
-    if [[ -n "$latency_line" ]]; then
-        # Convert from µs to ms and extract values (min/median/75th/95th/99th/max)
-        IFS='/' read -r lat_min lat_median lat_p75 lat_p95 lat_p99 lat_max <<< "$latency_line"
-        # Values are in microseconds, convert to milliseconds
-        lat_min=$((lat_min / 1000))
-        lat_median=$((lat_median / 1000))
-        lat_p95=$((lat_p95 / 1000))
-        lat_p99=$((lat_p99 / 1000))
-        lat_max=$((lat_max / 1000))
-    else
-        lat_min=0
-        lat_median=0
-        lat_p95=0
-        lat_p99=0
-        lat_max=0
+    local clat_min=0 clat_med=0 clat_p95=0 clat_p99=0 clat_max=0
+    if [[ -n "$confirm_lat_line" ]]; then
+        IFS='/' read -r clat_min clat_med _ clat_p95 clat_p99 clat_max <<< "$confirm_lat_line"
+        clat_min=$((clat_min / 1000)); clat_med=$((clat_med / 1000)); clat_p95=$((clat_p95 / 1000))
+        clat_p99=$((clat_p99 / 1000)); clat_max=$((clat_max / 1000))
     fi
 
-    echo "${latency_ms},${send_rate},${recv_rate},${lat_min},${lat_median},${lat_p95},${lat_p99},${lat_max}"
+    # Parse consumer latency
+    local cons_lat_line
+    cons_lat_line=$(echo "$output" | grep "consumer latency" | grep "min/median" | \
+        sed -n 's/.*[^0-9]\([0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\/[0-9][0-9]*\).*/\1/p' | tail -1)
+
+    local cons_min=0 cons_med=0 cons_p95=0 cons_p99=0 cons_max=0
+    if [[ -n "$cons_lat_line" ]]; then
+        IFS='/' read -r cons_min cons_med _ cons_p95 cons_p99 cons_max <<< "$cons_lat_line"
+        cons_min=$((cons_min / 1000)); cons_med=$((cons_med / 1000)); cons_p95=$((cons_p95 / 1000))
+        cons_p99=$((cons_p99 / 1000)); cons_max=$((cons_max / 1000))
+    fi
+
+    # Output CSV format: latency,send,recv,confirm(min,med,95,99,max),consumer(min,med,95,99,max)
+    echo "${latency_ms},${send_rate},${recv_rate},${clat_min},${clat_med},${clat_p95},${clat_p99},${clat_max},${cons_min},${cons_med},${cons_p95},${cons_p99},${cons_max}"
 }
 
 # --- Main ---
@@ -283,7 +373,7 @@ CSV_FILE="$RESULTS_DIR/${TIMESTAMP}-latency-sweep.csv"
 REPORT_FILE="$RESULTS_DIR/${TIMESTAMP}-latency-sweep-report.txt"
 
 # Initialize CSV
-echo "latency_ms,send_rate_msg_s,recv_rate_msg_s,confirm_lat_min_ms,confirm_lat_median_ms,confirm_lat_p95_ms,confirm_lat_p99_ms,confirm_lat_max_ms" > "$CSV_FILE"
+echo "latency_ms,send_rate_msg_s,recv_rate_msg_s,confirm_min_ms,confirm_med_ms,confirm_p95_ms,confirm_p99_ms,confirm_max_ms,consumer_min_ms,consumer_med_ms,consumer_p95_ms,consumer_p99_ms,consumer_max_ms" > "$CSV_FILE"
 
 # Initialize report
 {
@@ -296,16 +386,19 @@ echo "latency_ms,send_rate_msg_s,recv_rate_msg_s,confirm_lat_min_ms,confirm_lat_
     echo ""
     echo "## Raw Results"
     echo ""
-    echo "Note: Latency columns show confirm latency (time to broker acknowledgment)."
+    echo "Note: Latency columns show P99 latency in ms."
     echo ""
-    printf "| %-10s | %-12s | %-12s | %-10s | %-12s | %-10s | %-10s |\n" \
-        "Net Lat" "Send Rate" "Recv Rate" "Cfm Min" "Cfm Median" "Cfm P95" "Cfm P99"
-    printf "| %-10s | %-12s | %-12s | %-10s | %-12s | %-10s | %-10s |\n" \
-        "----------" "------------" "------------" "----------" "------------" "----------" "----------"
+    printf "| %-8s | %-12s | %-12s | %-12s | %-12s |\n" \
+        "Network" "Send Rate" "Recv Rate" "Confirm P99" "Consumer P99"
+    printf "| %-8s | %-12s | %-12s | %-12s | %-12s |\n" \
+        "--------" "------------" "------------" "------------" "------------"
 } > "$REPORT_FILE"
 
 # Track results for summary
 declare -a results
+
+# Capture initial state before starting
+save_initial_state
 
 # Run tests at each latency value
 for latency_ms in "${LATENCY_VALUES[@]}"; do
@@ -327,11 +420,11 @@ for latency_ms in "${LATENCY_VALUES[@]}"; do
 
     # Parse for report (strip any ANSI codes first)
     clean_result=$(echo "$result" | strip_ansi)
-    IFS=',' read -r lat send recv lat_min lat_med lat_p95 lat_p99 lat_max <<< "$clean_result"
-    printf "| %-10s | %-12s | %-12s | %-10s | %-12s | %-10s | %-10s |\n" \
-        "${lat}ms" "${send} msg/s" "${recv} msg/s" "${lat_min}ms" "${lat_med}ms" "${lat_p95}ms" "${lat_p99}ms" >> "$REPORT_FILE"
+    IFS=',' read -r lat send recv c_min c_med c_p95 c_p99 c_max r_min r_med r_p95 r_p99 r_max <<< "$clean_result"
+    printf "| %-8s | %-12s | %-12s | %-12s | %-12s |\n" \
+        "${lat}ms" "${send} msg/s" "${recv} msg/s" "${c_p99}ms" "${r_p99}ms" >> "$REPORT_FILE"
 
-    log_pass "Completed: send=${send} msg/s, recv=${recv} msg/s, confirm_p99=${lat_p99}ms"
+    log_pass "Completed: send=${send} msg/s, recv=${recv} msg/s, confirm_p99=${c_p99}ms, consumer_p99=${r_p99}ms"
 done
 
 # Clear latency configuration and optionally restore original
@@ -357,7 +450,7 @@ fi
 
         for result in "${results[@]}"; do
             clean_res=$(echo "$result" | strip_ansi)
-            IFS=',' read -r lat send recv _ _ _ _ _ <<< "$clean_res"
+            IFS=',' read -r lat send recv _ _ _ _ _ _ _ _ _ _ <<< "$clean_res"
             if [[ "$baseline_send" -gt 0 ]]; then
                 send_pct=$((100 * send / baseline_send))
                 echo "- At ${lat}ms: ${send_pct}% of baseline throughput (${send} msg/s)"
