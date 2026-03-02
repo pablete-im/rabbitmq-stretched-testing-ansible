@@ -10,17 +10,18 @@
 #
 # Examples:
 #   ./perf-tests/run-test.sh baseline
-#   ./perf-tests/run-test.sh baseline --host 10.85.10.234
-#   ./perf-tests/run-test.sh streams --host 10.85.10.234
-#   ./perf-tests/run-test.sh federation-test --pub-host 10.85.10.234 --con-host 10.85.10.234
-#   ./perf-tests/run-test.sh baseline --host 10.85.10.234 --label "with-latency"
+#   ./perf-tests/run-test.sh baseline --hosts 10.85.10.234
+#   ./perf-tests/run-test.sh streams --hosts 10.85.10.234
+#   ./perf-tests/run-test.sh federation-test --pub-hosts 10.85.10.234 --con-hosts 10.85.10.234
+#   ./perf-tests/run-test.sh baseline --hosts 10.85.10.234 --label "with-latency"
+#   ./perf-tests/run-test.sh baseline --hosts 10.85.10.234,10.85.10.235,10.85.10.236
 #
 # TLS Examples:
-#   ./perf-tests/run-test.sh baseline --host 110.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
-#   ./perf-tests/run-test.sh streams --host 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/run-test.sh baseline --hosts 110.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/run-test.sh streams --hosts 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
 #
 # Federation Test (uses instance synchronization for separate producer/consumer hosts):
-#   ./perf-tests/run-test.sh federation-test --pub-host 10.85.10.234 --con-host 10.85.10.234
+#   ./perf-tests/run-test.sh federation-test --pub-hosts 10.85.10.234 --con-hosts 10.85.10.234
 # =============================================================================
 set -euo pipefail
 
@@ -30,9 +31,9 @@ SCENARIOS_DIR="$SCRIPT_DIR/scenarios"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Defaults
-HOST="10.85.10.234"
-PUB_HOST=""
-CON_HOST=""
+HOSTS="10.85.10.234"
+PUB_HOSTS=""
+CON_HOSTS=""
 USER="admin"
 PASSWORD=""
 LABEL=""
@@ -47,9 +48,9 @@ shift || true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)            HOST="$2"; shift 2 ;;
-        --pub-host)        PUB_HOST="$2"; shift 2 ;;
-        --con-host)        CON_HOST="$2"; shift 2 ;;
+        --hosts)           HOSTS="$2"; shift 2 ;;
+        --pub-hosts)       PUB_HOSTS="$2"; shift 2 ;;
+        --con-hosts)       CON_HOSTS="$2"; shift 2 ;;
         --user)            USER="$2"; shift 2 ;;
         --password)        PASSWORD="$2"; shift 2 ;;
         --label)           LABEL="$2"; shift 2 ;;
@@ -73,9 +74,9 @@ if [[ -z "$SCENARIO" ]]; then
     done
     echo ""
     echo "Options:"
-    echo "  --host <ip>              RabbitMQ host (default: 192.168.20.200)"
-    echo "  --pub-host <ip>          Publisher target host (for federation tests)"
-    echo "  --con-host <ip>          Consumer target host (for federation tests)"
+    echo "  --hosts <ip1,ip2,...>    RabbitMQ hosts (comma-separated, default: 10.85.10.234)"
+    echo "  --pub-hosts <ip1,ip2>    Publisher target hosts (for federation tests)"
+    echo "  --con-hosts <ip1,ip2>    Consumer target hosts (for federation tests)"
     echo "  --user <user>            RabbitMQ user (default: admin)"
     echo "  --password <pass>        RabbitMQ password (or set RMQ_PASSWORD env var)"
     echo "  --label <label>          Label to add to result filename"
@@ -118,6 +119,25 @@ if [[ -z "$PASSWORD" ]]; then
     echo
 fi
 
+# Helper function to build URI list from comma-separated hosts
+build_uris() {
+    local hosts="$1"
+    local protocol="$2"
+    local port="$3"
+    local user="$4"
+    local password="$5"
+    
+    local uris=""
+    IFS=',' read -ra HOST_ARRAY <<< "$hosts"
+    for host in "${HOST_ARRAY[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        if [[ -n "$uris" ]]; then
+            uris="${uris},"
+        fi
+        uris="${uris}${protocol}://${user}:${password}@${host}:${port}"
+    done
+    echo "$uris"
+}
 # --- Parse scenario YAML (lightweight, no external deps) ---
 parse_yaml_value() {
     grep "^${1}:" "$SCENARIO_FILE" | head -1 | sed "s/^${1}: *//; s/#.*//; s/\"//g; s/ *$//" || true
@@ -170,10 +190,12 @@ fi
 # --- Build command ---
 if [[ "$TEST_TYPE" == "stream" ]]; then
     # Stream perf test
+    STREAM_URIS=$(build_uris "$HOSTS" "$STREAM_PROTOCOL" "$STREAM_PORT" "$USER" "$PASSWORD")
+    
     CMD=("java")
     [[ -n "$JVM_OPTS" ]] && CMD+=($JVM_OPTS)
     CMD+=(-jar "$TOOLS_DIR/stream-perf-test.jar")
-    CMD+=(--uris "${STREAM_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${STREAM_PORT}")
+    CMD+=(--uris "$STREAM_URIS")
     CMD+=(--delete-streams)
     [[ -n "$PUBLISHERS" ]] && CMD+=(--producers "$PUBLISHERS")
     [[ -n "$CONSUMERS" ]] && CMD+=(--consumers "$CONSUMERS")
@@ -184,13 +206,13 @@ if [[ "$TEST_TYPE" == "stream" ]]; then
     [[ -n "$OFFSET" ]] && CMD+=(--offset "$OFFSET")
 else
     # AMQP perf test
-    TARGET_HOST="${PUB_HOST:-$HOST}"
-    AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${TARGET_HOST}:${AMQP_PORT}"
+    TARGET_HOSTS="${PUB_HOSTS:-$HOSTS}"
+    AMQP_URIS=$(build_uris "$TARGET_HOSTS" "$AMQP_PROTOCOL" "$AMQP_PORT" "$USER" "$PASSWORD")
 
     CMD=("java")
     [[ -n "$JVM_OPTS" ]] && CMD+=($JVM_OPTS)
     CMD+=(-jar "$TOOLS_DIR/perf-test.jar")
-    CMD+=(--uri "$AMQP_URI")
+    CMD+=(--uris "$AMQP_URIS")
     CMD+=(--id "$TEST_NAME")
     CMD+=(--queue "${QUEUE_NAME:-$TEST_NAME}")
     [[ -n "$DURATION" ]] && CMD+=(--time "$DURATION")
@@ -232,15 +254,15 @@ echo "  RabbitMQ Performance Test"
 echo "=============================================="
 echo "  Scenario:  $SCENARIO"
 echo "  Type:      $TEST_TYPE"
-echo "  Host:      ${PUB_HOST:-$HOST}"
-[[ -n "$CON_HOST" ]] && echo "  Con Host:  $CON_HOST"
+echo "  Hosts:     ${PUB_HOSTS:-$HOSTS}"
+[[ -n "$CON_HOSTS" ]] && echo "  Con Hosts: $CON_HOSTS"
 echo "  Duration:  ${DURATION}s"
 echo "  Results:   $RESULT_FILE"
 echo "=============================================="
 echo ""
 
 # --- Handle Federation Tests (separate producer/consumer hosts) ---
-if [[ -n "$CON_HOST" ]]; then
+if [[ -n "$CON_HOSTS" ]]; then
     echo "🔄 Federation Test Mode: Using instance synchronization"
     echo ""
     
@@ -253,12 +275,11 @@ if [[ -n "$CON_HOST" ]]; then
     
     if [[ "$TEST_TYPE" == "stream" ]]; then
         # Stream producer
+        PRODUCER_URIS=$(build_uris "$HOSTS" "$STREAM_PROTOCOL" "$STREAM_PORT" "$USER" "$PASSWORD")
         PRODUCER_CMD+=(-jar "$TOOLS_DIR/stream-perf-test.jar")
-        PRODUCER_CMD+=(--uris "${STREAM_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${STREAM_PORT}")
+        PRODUCER_CMD+=(--uris "$PRODUCER_URIS")
         PRODUCER_CMD+=(--producers "${PUBLISHERS:-1}")
         PRODUCER_CMD+=(--consumers 0)
-        #PRODUCER_CMD+=(--id "$SYNC_ID")
-        #PRODUCER_CMD+=(--expected-instances 2)
         PRODUCER_CMD+=(--delete-streams)
         [[ -n "$DURATION" ]] && PRODUCER_CMD+=(--time "$DURATION")
         [[ -n "$MESSAGE_SIZE" ]] && PRODUCER_CMD+=(--size "$MESSAGE_SIZE")
@@ -266,8 +287,9 @@ if [[ -n "$CON_HOST" ]]; then
         [[ -n "$STREAM_NAME" ]] && PRODUCER_CMD+=(--streams "$STREAM_NAME")
     else
         # AMQP producer
+        PRODUCER_URIS=$(build_uris "${PUB_HOSTS:-$HOSTS}" "$AMQP_PROTOCOL" "$AMQP_PORT" "$USER" "$PASSWORD")
         PRODUCER_CMD+=(-jar "$TOOLS_DIR/perf-test.jar")
-        PRODUCER_CMD+=(--uri "$AMQP_URI")
+        PRODUCER_CMD+=(--uris "$PRODUCER_URIS")
         PRODUCER_CMD+=(--producers "${PUBLISHERS:-1}")
         PRODUCER_CMD+=(--consumers 0)
         PRODUCER_CMD+=(--id "$SYNC_ID")
@@ -298,21 +320,19 @@ if [[ -n "$CON_HOST" ]]; then
     
     if [[ "$TEST_TYPE" == "stream" ]]; then
         # Stream consumer
-        CON_URI="${STREAM_PROTOCOL}://${USER}:${PASSWORD}@${CON_HOST}:${STREAM_PORT}"
+        CONSUMER_URIS=$(build_uris "$CON_HOSTS" "$STREAM_PROTOCOL" "$STREAM_PORT" "$USER" "$PASSWORD")
         CONSUMER_CMD+=(-jar "$TOOLS_DIR/stream-perf-test.jar")
-        CONSUMER_CMD+=(--uris "$CON_URI")
+        CONSUMER_CMD+=(--uris "$CONSUMER_URIS")
         CONSUMER_CMD+=(--producers 0)
         CONSUMER_CMD+=(--consumers "${CONSUMERS:-1}")
-        #CONSUMER_CMD+=(--id "$SYNC_ID")
-        #CONSUMER_CMD+=(--expected-instances 2)
         [[ -n "$DURATION" ]] && CONSUMER_CMD+=(--time "$DURATION")
         [[ -n "$STREAM_NAME" ]] && CONSUMER_CMD+=(--streams "$STREAM_NAME")
         [[ -n "$OFFSET" ]] && CONSUMER_CMD+=(--offset "$OFFSET")
     else
         # AMQP consumer
-        CON_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${CON_HOST}:${AMQP_PORT}"
+        CONSUMER_URIS=$(build_uris "$CON_HOSTS" "$AMQP_PROTOCOL" "$AMQP_PORT" "$USER" "$PASSWORD")
         CONSUMER_CMD+=(-jar "$TOOLS_DIR/perf-test.jar")
-        CONSUMER_CMD+=(--uri "$CON_URI")
+        CONSUMER_CMD+=(--uris "$CONSUMER_URIS")
         CONSUMER_CMD+=(--producers 0)
         CONSUMER_CMD+=(--consumers "${CONSUMERS:-1}")
         CONSUMER_CMD+=(--id "$SYNC_ID")
@@ -337,10 +357,10 @@ if [[ -n "$CON_HOST" ]]; then
     fi
     
     # Display commands for federation test
-    echo "📤 Producer Command (${PUB_HOST:-$HOST}):"
+    echo "📤 Producer Command (${PUB_HOSTS:-$HOSTS}):"
     echo "   ${PRODUCER_CMD[*]}"
     echo ""
-    echo "📥 Consumer Command ($CON_HOST):"
+    echo "📥 Consumer Command ($CON_HOSTS):"
     echo "   ${CONSUMER_CMD[*]}"
     echo ""
     
@@ -349,8 +369,8 @@ if [[ -n "$CON_HOST" ]]; then
         echo "# Federation Test - Producer Results"
         echo "# Scenario: $SCENARIO"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-        echo "# Producer Host: ${PUB_HOST:-$HOST}"
-        echo "# Consumer Host: $CON_HOST"
+        echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
+        echo "# Consumer Host: $CON_HOSTS"
         [[ -n "$LABEL" ]] && echo "# Label: $LABEL"
         echo "# Duration: ${DURATION}s"
         echo "# Sync ID: $SYNC_ID"
@@ -362,8 +382,8 @@ if [[ -n "$CON_HOST" ]]; then
         echo "# Federation Test - Consumer Results"
         echo "# Scenario: $SCENARIO"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-        echo "# Producer Host: ${PUB_HOST:-$HOST}"
-        echo "# Consumer Host: $CON_HOST"
+        echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
+        echo "# Consumer Host: $CON_HOSTS"
         [[ -n "$LABEL" ]] && echo "# Label: $LABEL"
         echo "# Duration: ${DURATION}s"
         echo "# Sync ID: $SYNC_ID"
@@ -371,12 +391,12 @@ if [[ -n "$CON_HOST" ]]; then
         echo "#"
     } > "${RESULT_FILE}.consumer"
     
-    echo "🚀 Starting consumer process on $CON_HOST (will wait for producer)..."
+    echo "🚀 Starting consumer process on $CON_HOSTS (will wait for producer)..."
     "${CONSUMER_CMD[@]}" 2>&1 | tee -a "${RESULT_FILE}.consumer" &
     CONSUMER_PID=$!
     
     echo ""
-    echo "🚀 Starting producer process on ${PUB_HOST:-$HOST} (will synchronize with consumer)..."
+    echo "🚀 Starting producer process on ${PUB_HOSTS:-$HOSTS} (will synchronize with consumer)..."
     echo ""
     
     "${PRODUCER_CMD[@]}" 2>&1 | tee -a "$RESULT_FILE"
@@ -400,7 +420,7 @@ else
     {
         echo "# Scenario: $SCENARIO"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-        echo "# Host: ${PUB_HOST:-$HOST}"
+        echo "# Host: ${PUB_HOSTS:-$HOSTS}"
         [[ -n "$LABEL" ]] && echo "# Label: $LABEL"
         echo "# Duration: ${DURATION}s"
         echo "# Command: ${CMD[*]}"
