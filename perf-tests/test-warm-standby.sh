@@ -46,6 +46,7 @@ CROSS_REGION_DR1="10.85.10.244"    # TX-Cluster-1 (pve-schwab-rmq07) - first nod
 CROSS_REGION_DR2=""                # TX-Cluster-2 (Not defined in inventory)
 
 # All nodes in each cluster (standby replication may run on any one node)
+AZ_CLUSTER_1_NODES=("10.85.10.234" "10.85.10.235" "10.85.10.236")
 AZ_CLUSTER_2_NODES=("10.85.10.241" "10.85.10.242" "10.85.10.243")
 TX_CLUSTER_1_NODES=("10.85.10.244" "10.85.10.245" "10.85.10.246")
 TX_CLUSTER_2_NODES=()              # Not defined in inventory
@@ -125,8 +126,26 @@ else
     JVM_OPTS=""
 fi
 
-# Construct AMQP URI for upstream
-AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${UPSTREAM_HOST}:${AMQP_PORT}"
+# Helper function to build URI list from comma-separated hosts
+build_uris() {
+    local hosts_array=("$@")
+    local protocol="$AMQP_PROTOCOL"
+    local port="$AMQP_PORT"
+    local user="$USER"
+    local password="$PASSWORD"
+    
+    local uris=""
+    for host in "${hosts_array[@]}"; do
+        if [[ -n "$uris" ]]; then
+            uris="${uris},"
+        fi
+        uris="${uris}${protocol}://${user}:${password}@${host}:${port}"
+    done
+    echo "$uris"
+}
+
+# Construct AMQP URIs for upstream cluster (multiple hosts for load balancing)
+AMQP_URIS=$(build_uris "${AZ_CLUSTER_1_NODES[@]}")
 
 # --- Helper functions ---
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -640,7 +659,7 @@ test_replication_lag() {
     # Start publisher in background
     log_info "  Starting sustained publish load..."
     java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 2 \
@@ -913,7 +932,7 @@ test_sustained_replication_throughput() {
 
     local output
     output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "warm-standby-throughput-$(date +%s)" \
         --producers 2 \
@@ -1029,7 +1048,7 @@ test_stream_consumer_latency() {
         log_warn "  Queue created as '$q_type' instead of 'stream'. Retrying with explicit declare..."
         # Try creating via perf-test which handles declaration well
         java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-            --uri "$AMQP_URI" \
+            --uris "$AMQP_URIS" \
             --queue "$stream_name" \
             --queue-args "x-queue-type=stream" \
             --producers 1 \
@@ -1226,7 +1245,7 @@ test_stream_consumer_latency() {
     log_info "  Starting producer on Upstream..."
     local prod_output_file="/tmp/wsr-stream-prod.txt"
     java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --queue "$stream_name" \
         --predeclared \
         --producers 1 \
@@ -1251,8 +1270,6 @@ test_stream_consumer_latency() {
 
     log_info ""
     log_info "  === WSR Stream Latency Results ==="
-    printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-12s |\n" "Role" "Cluster" "Min" "Med" "P99" "Max" "Count"
-    printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-12s |\n" "---------------" "---------------" "----------" "----------" "----------" "----------" "------------"
 
     # Function to parse latency from perf-test output
     parse_latency() {
@@ -1299,6 +1316,10 @@ test_stream_consumer_latency() {
     local stream_len
     stream_len=$(get_queue_messages "$UPSTREAM_HOST" "$stream_name")
     log_info "  Debug: Stream length on upstream: $stream_len"
+
+    # Print table headers after debug output
+    printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-12s |\n" "Role" "Cluster" "Min" "Med" "P99" "Max" "Count"
+    printf "| %-15s | %-15s | %-10s | %-10s | %-10s | %-10s | %-12s |\n" "---------------" "---------------" "----------" "----------" "----------" "----------" "------------"
 
     # Producer Confirm Latency
     local prod_lats
@@ -1494,11 +1515,11 @@ test_promotion() {
 
     log_info "  Publishing $message_count messages to upstream..."
     log_info "  Queue: $queue"
-    log_info "  Target: ${AMQP_URI//:????@/:****@}"
+    log_info "  Targets: ${AMQP_URIS//:????@/:****@}"
 
     local pub_output
     pub_output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 1 \
@@ -1686,7 +1707,9 @@ echo "  Upstream:         $UPSTREAM_HOST (AZ-Cluster-1)"
 echo "  Regional Standby: $REGIONAL_STANDBY (AZ-Cluster-2)"
 if ! $SKIP_CROSS_REGION; then
     echo "  Cross-Region DR:  $CROSS_REGION_DR1 (TX-Cluster-1)"
-    echo "                    $CROSS_REGION_DR2 (TX-Cluster-2)"
+    if [[ -n "$CROSS_REGION_DR2" ]]; then
+        echo "                    $CROSS_REGION_DR2 (TX-Cluster-2)"
+    fi
 fi
 if $TEST_PROMOTION; then
     echo "  Promotion Test:   ENABLED (will actually promote standby!)"
@@ -1706,7 +1729,7 @@ TESTS_FAILED=0
     echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     echo "# Upstream: $UPSTREAM_HOST"
     echo "# Regional Standby: $REGIONAL_STANDBY"
-    echo "# Cross-Region DR: $CROSS_REGION_DR1, $CROSS_REGION_DR2"
+    echo "# Cross-Region DR: $CROSS_REGION_DR1$(if [[ -n "$CROSS_REGION_DR2" ]]; then echo ", $CROSS_REGION_DR2"; fi)"
     echo "#"
     echo ""
 } > "$RESULT_FILE"
