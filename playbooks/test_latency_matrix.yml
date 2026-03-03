@@ -1,0 +1,132 @@
+---
+# Standalone Latency Matrix Test
+# Tests network latency between all nodes without modifying TC configuration
+- name: Test Network Latency Matrix
+  hosts: nodes
+  gather_facts: false
+  tasks:
+    - name: Test latency to all other nodes
+      ansible.builtin.shell: |
+        {% for host in groups['nodes'] %}
+        {% set target_ip = hostvars[host]['ansible_host'] %}
+        {% set my_ip = hostvars[inventory_hostname]['ansible_host'] %}
+        {% if target_ip != my_ip %}
+        echo "{{ inventory_hostname }},{{ host }},$(ping -c3 -q {{ target_ip }} 2>/dev/null | grep 'rtt min/avg/max' | cut -d'/' -f5 | cut -d' ' -f1 || echo 'FAIL')"
+        {% endif %}
+        {% endfor %}
+      register: latency_results
+      changed_when: false
+
+    - name: Collect latency results
+      ansible.builtin.set_fact:
+        node_latency_data: "{{ latency_results.stdout_lines }}"
+
+- name: Generate Latency Matrix Report
+  hosts: localhost
+  gather_facts: true
+  become: false
+  connection: local
+  run_once: true
+  tasks:
+    - name: Collect all latency data
+      ansible.builtin.set_fact:
+        all_latency_data: "{{ all_latency_data | default([]) }}"
+      vars:
+        all_latency_data: |
+          {% set data = [] %}
+          {% for node in groups['nodes'] %}
+          {% if hostvars[node]['node_latency_data'] is defined %}
+          {% for entry in hostvars[node]['node_latency_data'] %}
+          {% set _ = data.append(entry) %}
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+          {{ data }}
+
+    - name: Debug collected latency data
+      ansible.builtin.debug:
+        msg: "Collected {{ all_latency_data | length }} latency entries"
+
+    - name: Build latency lookup dictionary
+      ansible.builtin.set_fact:
+        latency_lookup: "{{ latency_lookup | default({}) | combine({item.split(',')[0] + '->' + item.split(',')[1]: item.split(',')[2]}) }}"
+      loop: "{{ all_latency_data }}"
+      when: item is string and item.split(',') | length == 3
+
+    - name: Build formatted table lines
+      ansible.builtin.set_fact:
+        table_lines: "{{ table_lines | default([]) + [line] }}"
+      vars:
+        line: "{{ '%-18s' | format(item) }}{% for target_node in groups['nodes'] | sort %}{% if item == target_node %} | {{ '%8s' | format('--') }}{% else %}{% set lookup_key = item + '->' + target_node %}{% if lookup_key in latency_lookup %} | {{ '%8s' | format(latency_lookup[lookup_key] + 'ms') }}{% else %} | {{ '%8s' | format('N/A') }}{% endif %}{% endif %}{% endfor %}"
+      loop: "{{ groups['nodes'] | sort }}"
+
+    - name: Build complete table as list
+      ansible.builtin.set_fact:
+        complete_table_list: 
+          - "================================================================================"
+          - "NETWORK LATENCY MATRIX (Average RTT in ms)"
+          - "================================================================================"
+          - ""
+          - "Source \\ Target   {% for target_node in groups['nodes'] | sort %} | {{ '%8s' | format(target_node[-5:]) }}{% endfor %}"
+          - "------------------{% for target_node in groups['nodes'] | sort %}-+---------{% endfor %}"
+
+    - name: Add data rows to table
+      ansible.builtin.set_fact:
+        complete_table_list: "{{ complete_table_list + [item] }}"
+      loop: "{{ table_lines }}"
+
+    - name: Add table footer and legend
+      ansible.builtin.set_fact:
+        complete_table_list: "{{ complete_table_list + footer_lines }}"
+      vars:
+        footer_lines:
+          - "================================================================================"
+          - ""
+          - "Legend:"
+          - "- Same node: --"
+          - "- Not tested: N/A"
+          - "- Values show average RTT in milliseconds"
+          - ""
+          - "Expected latencies based on AZ configuration:"
+          - "- Same AZ: ~0.1-0.2ms (natural network latency)"
+          - "- Different AZ, same region: ~2-4ms (1.5ms + jitter + natural)"
+          - "- Cross-region: ~25-35ms (15ms + jitter + natural)"
+
+    - name: Display Latency Matrix Table
+      ansible.builtin.debug:
+        msg: "{{ complete_table_list }}"
+
+    - name: Generate CSV Report
+      ansible.builtin.copy:
+        content: |
+          # Network Latency Matrix Report
+          # Generated: {{ ansible_date_time.iso8601 }}
+          #
+          Source,Target,Source_AZ,Target_AZ,Source_Region,Target_Region,Latency_ms,Expected_Category
+          {% for entry in all_latency_data %}
+          {% if entry is string and entry.split(',') | length == 3 %}
+          {% set parts = entry.split(',') %}
+          {% set source_node = parts[0] %}
+          {% set target_node = parts[1] %}
+          {% set latency_val = parts[2] %}
+          {% set source_az = hostvars[source_node]['az_group'] %}
+          {% set target_az = hostvars[target_node]['az_group'] %}
+          {% set source_region = 'arizona' if source_node in groups['arizona'] else 'texas' %}
+          {% set target_region = 'arizona' if target_node in groups['arizona'] else 'texas' %}
+          {% if source_region != target_region %}
+          {% set category = 'cross-region' %}
+          {% elif source_az != target_az %}
+          {% set category = 'metro' %}
+          {% else %}
+          {% set category = 'same-az' %}
+          {% endif %}
+          {{ source_node }},{{ target_node }},{{ source_az }},{{ target_az }},{{ source_region }},{{ target_region }},{{ latency_val }},{{ category }}
+          {% endif %}
+          {% endfor %}
+        dest: "/tmp/network_latency_matrix.csv"
+        mode: '0644'
+      delegate_to: localhost
+
+    - name: Display CSV file location
+      ansible.builtin.debug:
+        msg: "Detailed CSV report saved to: /tmp/network_latency_matrix.csv"

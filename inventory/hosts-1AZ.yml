@@ -30,10 +30,10 @@ all:
           az_group: az_az1
         pve-schwab-rmq02:
           ansible_host: 10.85.10.235
-          az_group: az_az1
+          az_group: az_az2
         pve-schwab-rmq03:
           ansible_host: 10.85.10.236
-          az_group: az_az2
+          az_group: az_az3
 
     # AZ-Cluster-2: 3 nodes (one per AZ)
     az-cluster-2:
@@ -49,7 +49,7 @@ all:
           az_group: az_az2
         pve-schwab-rmq06:
           ansible_host: 10.85.10.243
-          az_group: az_az2
+          az_group: az_az3
 
     # ============================================
     # Region: Texas
@@ -70,10 +70,36 @@ all:
           az_group: tx_az1
         pve-schwab-rmq08:
           ansible_host: 10.85.10.245
-          az_group: tx_az1
+          az_group: tx_az2
         pve-schwab-rmq09:
           ansible_host: 10.85.10.246
-          az_group: tx_az2
+          az_group: tx_az3
+
+    # ============================================
+    # AZ Groups (for latency rules if needed)
+    # ============================================
+    az_az1:
+      hosts:
+        pve-schwab-rmq01:
+        pve-schwab-rmq04:
+    az_az2:
+      hosts:
+        pve-schwab-rmq02:
+        pve-schwab-rmq05:
+    az_az3:
+      hosts:
+        pve-schwab-rmq03:
+        pve-schwab-rmq06:
+    
+    tx_az1:
+      hosts:
+        pve-schwab-rmq07:
+    tx_az2:
+      hosts:
+        pve-schwab-rmq08:
+    tx_az3:
+      hosts:
+        pve-schwab-rmq09:
 
     # Localhost for control tasks
     control:

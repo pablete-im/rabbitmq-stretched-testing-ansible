@@ -1,10 +1,16 @@
 ---
 # Network Latency Simulation for Tanzu RabbitMQ Cluster
 # 
-# This playbook simulates a multi-region/multi-AZ environment:
-# - Metro Latency (Within Region): ~3ms delay
-# - Cross-Region Latency (Between Regions): ~35ms delay
+# This playbook simulates a multi-region/multi-AZ environment based on az_group topology:
+# - Same AZ (az_az1, tx_az1, etc.): 0ms delay (no latency between nodes in same AZ)
+# - Metro Latency (Different AZs, Same Region): ~1.5ms delay (az_az1 <-> az_az2)
+# - Cross-Region Latency (Different Regions): ~15ms delay (arizona <-> texas)
 # - SSH Traffic (Port 22): 0ms (Bypasses latency to prevent disconnects)
+#
+# Examples:
+# - pve-schwab-rmq01 (az-cluster-1, az_az1) <-> pve-schwab-rmq04 (az-cluster-2, az_az1): 0ms
+# - pve-schwab-rmq01 (az_az1) <-> pve-schwab-rmq03 (az_az2): 1.5ms (metro)
+# - pve-schwab-rmq01 (arizona) <-> pve-schwab-rmq07 (texas): 15ms (cross-region)
 
 - name: Configure Network Latency Simulation
   hosts: nodes
@@ -43,16 +49,17 @@
       poll: 5
       changed_when: false
 
-    - name: Set node region facts
+    - name: Set node region and AZ facts
       ansible.builtin.set_fact:
-        # Detect region based on inventory groups (with hyphens)
-        my_region: "{{ 'arizona' if inventory_hostname in groups['arizona'] or inventory_hostname in groups['az-cluster-1'] or inventory_hostname in groups['az-cluster-2'] else 'texas' }}"
-        other_region: "{{ 'texas' if inventory_hostname in groups['arizona'] or inventory_hostname in groups['az-cluster-1'] or inventory_hostname in groups['az-cluster-2'] else 'arizona' }}"
+        # Detect region based on inventory groups
+        my_region: "{{ 'arizona' if inventory_hostname in groups['arizona'] else 'texas' }}"
+        # Get my AZ group from host vars
+        my_az_group: "{{ hostvars[inventory_hostname]['az_group'] }}"
 
     - name: Setup TC structure and latency bands
       ansible.builtin.shell: |
-        # Setup root qdisc
-        tc qdisc add dev {{ network.interface }} root handle 1: prio bands 4
+        # Setup root qdisc with custom priomap (default traffic goes to band 1)
+        tc qdisc add dev {{ network.interface }} root handle 1: prio bands 4 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
         
         # Setup Band 2 (Metro)
         tc qdisc add dev {{ network.interface }} parent 1:2 handle 20: \
@@ -66,20 +73,29 @@
         tc filter add dev {{ network.interface }} protocol ip parent 1:0 prio 1 handle 10 fw flowid 1:1
       changed_when: true
 
-    - name: Apply latency filters to all peers (Batch mode)
+    - name: Apply latency filters based on AZ and region topology
       ansible.builtin.shell: |
-        # Apply metro latency to nodes in my region
-        {% for host in groups[my_region] %}
-        {% set ip = hostvars[host]['ansible_host'] %}
-        {% if ip != hostvars[inventory_hostname]['ansible_host'] %}
-        tc filter add dev {{ network.interface }} parent 1:0 protocol ip prio 2 u32 match ip dst {{ ip }}/32 flowid 1:2
+        {% for host in groups['nodes'] %}
+        {% set target_ip = hostvars[host]['ansible_host'] %}
+        {% set target_az = hostvars[host]['az_group'] %}
+        {% set target_region = 'arizona' if host in groups['arizona'] else 'texas' %}
+        {% set my_ip = hostvars[inventory_hostname]['ansible_host'] %}
+        
+        {% if target_ip != my_ip %}
+        # Target: {{ host }} ({{ target_ip }}) - AZ: {{ target_az }}, Region: {{ target_region }}
+        
+        {% if target_region != my_region %}
+        # Cross-region latency: {{ my_region }} -> {{ target_region }}
+        tc filter add dev {{ network.interface }} parent 1:0 protocol ip prio 3 u32 match ip dst {{ target_ip }}/32 flowid 1:3
+        
+        {% elif target_az != my_az_group %}
+        # Metro latency: Same region ({{ my_region }}) but different AZ ({{ my_az_group }} -> {{ target_az }})
+        tc filter add dev {{ network.interface }} parent 1:0 protocol ip prio 2 u32 match ip dst {{ target_ip }}/32 flowid 1:2
+        
+        {% else %}
+        # Same AZ ({{ my_az_group }}): No latency filter needed (uses default band 1)
         {% endif %}
-        {% endfor %}
-
-        # Apply cross-region latency to nodes in other region
-        {% for host in groups[other_region] %}
-        {% set ip = hostvars[host]['ansible_host'] %}
-        tc filter add dev {{ network.interface }} parent 1:0 protocol ip prio 3 u32 match ip dst {{ ip }}/32 flowid 1:3
+        {% endif %}
         {% endfor %}
       changed_when: true
 
@@ -91,3 +107,159 @@
     - name: Display TC status
       ansible.builtin.debug:
         var: tc_verify.stdout_lines
+
+    - name: Test latency to all other nodes
+      ansible.builtin.shell: |
+        {% for host in groups['nodes'] %}
+        {% set target_ip = hostvars[host]['ansible_host'] %}
+        {% set my_ip = hostvars[inventory_hostname]['ansible_host'] %}
+        {% if target_ip != my_ip %}
+        echo "{{ inventory_hostname }},{{ host }},$(ping -c3 -q {{ target_ip }} 2>/dev/null | grep 'rtt min/avg/max' | cut -d'/' -f5 | cut -d' ' -f1 || echo 'FAIL')"
+        {% endif %}
+        {% endfor %}
+      register: latency_results
+      changed_when: false
+
+    - name: Collect latency results
+      ansible.builtin.set_fact:
+        node_latency_data: "{{ latency_results.stdout_lines }}"
+
+    - name: Display latency results for this node
+      ansible.builtin.debug:
+        msg: |
+          Latency results from {{ inventory_hostname }}:
+          {% for result in latency_results.stdout_lines %}
+          {{ result }}
+          {% endfor %}
+
+- name: Generate Latency Matrix Report
+  hosts: localhost
+  gather_facts: true
+  become: false
+  connection: local
+  run_once: true
+  tasks:
+    - name: Collect all latency data
+      ansible.builtin.set_fact:
+        all_latency_data: "{{ all_latency_data | default([]) }}"
+      vars:
+        all_latency_data: |
+          {% set data = [] %}
+          {% for node in groups['nodes'] %}
+          {% if hostvars[node]['node_latency_data'] is defined %}
+          {% for entry in hostvars[node]['node_latency_data'] %}
+          {% set _ = data.append(entry) %}
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+          {{ data }}
+
+    - name: Parse latency data into matrix
+      ansible.builtin.set_fact:
+        latency_matrix: "{{ latency_matrix | default({}) }}"
+      vars:
+        latency_matrix: |
+          {% set matrix = {} %}
+          {% for entry in all_latency_data %}
+          {% if entry is string %}
+          {% set parts = entry.split(',') %}
+          {% if parts|length == 3 %}
+          {% set source = parts[0] %}
+          {% set target = parts[1] %}
+          {% set latency = parts[2] %}
+          {% if source not in matrix %}
+          {% set _ = matrix.update({source: {}}) %}
+          {% endif %}
+          {% set _ = matrix[source].update({target: latency}) %}
+          {% endif %}
+          {% endif %}
+          {% endfor %}
+          {{ matrix }}
+
+    - name: Debug collected latency data
+      ansible.builtin.debug:
+        msg: "Collected {{ all_latency_data | length }} latency entries"
+
+    - name: Build latency lookup dictionary
+      ansible.builtin.set_fact:
+        latency_lookup: "{{ latency_lookup | default({}) | combine({item.split(',')[0] + '->' + item.split(',')[1]: item.split(',')[2]}) }}"
+      loop: "{{ all_latency_data }}"
+      when: item is string and item.split(',') | length == 3
+
+    - name: Build formatted table lines
+      ansible.builtin.set_fact:
+        table_lines: "{{ table_lines | default([]) + [line] }}"
+      vars:
+        line: "{{ '%-18s' | format(item) }}{% for target_node in groups['nodes'] | sort %}{% if item == target_node %} | {{ '%8s' | format('--') }}{% else %}{% set lookup_key = item + '->' + target_node %}{% if lookup_key in latency_lookup %} | {{ '%8s' | format(latency_lookup[lookup_key] + 'ms') }}{% else %} | {{ '%8s' | format('N/A') }}{% endif %}{% endif %}{% endfor %}"
+      loop: "{{ groups['nodes'] | sort }}"
+
+    - name: Build complete table as list
+      ansible.builtin.set_fact:
+        complete_table_list: 
+          - "================================================================================"
+          - "NETWORK LATENCY MATRIX (Average RTT in ms)"
+          - "================================================================================"
+          - ""
+          - "Source \\ Target   {% for target_node in groups['nodes'] | sort %} | {{ '%8s' | format(target_node[-5:]) }}{% endfor %}"
+          - "------------------{% for target_node in groups['nodes'] | sort %}-+---------{% endfor %}"
+
+    - name: Add data rows to table
+      ansible.builtin.set_fact:
+        complete_table_list: "{{ complete_table_list + [item] }}"
+      loop: "{{ table_lines }}"
+
+    - name: Add table footer and legend
+      ansible.builtin.set_fact:
+        complete_table_list: "{{ complete_table_list + footer_lines }}"
+      vars:
+        footer_lines:
+          - "================================================================================"
+          - ""
+          - "Legend:"
+          - "- Same node: --"
+          - "- Not tested: N/A"
+          - "- Values show average RTT in milliseconds"
+          - ""
+          - "Expected latencies based on AZ configuration:"
+          - "- Same AZ: ~0.1-0.2ms (natural network latency)"
+          - "- Different AZ, same region: ~2-4ms (1.5ms + jitter + natural)"
+          - "- Cross-region: ~25-35ms (15ms + jitter + natural)"
+
+    - name: Display Latency Matrix Table
+      ansible.builtin.debug:
+        msg: "{{ complete_table_list }}"
+
+    - name: Generate CSV Report
+      ansible.builtin.copy:
+        content: |
+          # Network Latency Matrix Report
+          # Generated: {{ ansible_date_time.iso8601 }}
+          #
+          Source,Target,Source_AZ,Target_AZ,Source_Region,Target_Region,Latency_ms,Expected_Category
+          {% for entry in all_latency_data %}
+          {% if entry is string and entry.split(',') | length == 3 %}
+          {% set parts = entry.split(',') %}
+          {% set source_node = parts[0] %}
+          {% set target_node = parts[1] %}
+          {% set latency_val = parts[2] %}
+          {% set source_az = hostvars[source_node]['az_group'] %}
+          {% set target_az = hostvars[target_node]['az_group'] %}
+          {% set source_region = 'arizona' if source_node in groups['arizona'] else 'texas' %}
+          {% set target_region = 'arizona' if target_node in groups['arizona'] else 'texas' %}
+          {% if source_region != target_region %}
+          {% set category = 'cross-region' %}
+          {% elif source_az != target_az %}
+          {% set category = 'metro' %}
+          {% else %}
+          {% set category = 'same-az' %}
+          {% endif %}
+          {{ source_node }},{{ target_node }},{{ source_az }},{{ target_az }},{{ source_region }},{{ target_region }},{{ latency_val }},{{ category }}
+          {% endif %}
+          {% endfor %}
+        dest: "/tmp/network_latency_matrix.csv"
+        mode: '0644'
+      delegate_to: localhost
+
+    - name: Display CSV file location
+      ansible.builtin.debug:
+        msg: "Detailed CSV report saved to: /tmp/network_latency_matrix.csv"
