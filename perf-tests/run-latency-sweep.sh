@@ -12,13 +12,13 @@
 #   - Summary report
 #
 # Usage:
-#   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200
-#   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --quick
-#   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --no-restore
+#   ./perf-tests/run-latency-sweep.sh --hosts 192.168.20.200
+#   ./perf-tests/run-latency-sweep.sh --hosts 192.168.20.200 --quick
+#   ./perf-tests/run-latency-sweep.sh --hosts 192.168.20.200 --no-restore
 #
 # TLS Usage:
-#   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
-#   ./perf-tests/run-latency-sweep.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/run-latency-sweep.sh --hosts 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/run-latency-sweep.sh --hosts 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -28,7 +28,7 @@ TOOLS_DIR="$SCRIPT_DIR/tools"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Defaults
-HOST="10.85.10.234"
+HOSTS="10.85.10.234"
 USER="admin"
 PASSWORD=""
 SSH_USER="root"
@@ -68,7 +68,7 @@ fi
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)            HOST="$2"; shift 2 ;;
+        --hosts)           HOSTS="$2"; shift 2 ;;
         --user)            USER="$2"; shift 2 ;;
         --password)        PASSWORD="$2"; shift 2 ;;
         --ssh-user)        SSH_USER="$2"; shift 2 ;;
@@ -112,7 +112,27 @@ if $QUICK_MODE; then
     TEST_DURATION=30
 fi
 
-AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${AMQP_PORT}"
+# Helper function to build URI list from comma-separated hosts
+build_uris() {
+    local hosts="$1"
+    local protocol="$2"
+    local port="$3"
+    local user="$4"
+    local password="$5"
+    
+    local uris=""
+    IFS=',' read -ra HOST_ARRAY <<< "$hosts"
+    for host in "${HOST_ARRAY[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        if [[ -n "$uris" ]]; then
+            uris="${uris},"
+        fi
+        uris="${uris}${protocol}://${user}:${password}@${host}:${port}"
+    done
+    echo "$uris"
+}
+
+AMQP_URIS=$(build_uris "$HOSTS" "$AMQP_PROTOCOL" "$AMQP_PORT" "$USER" "$PASSWORD")
 
 # Store initial configuration
 declare -A INITIAL_LATENCY_CONFIG
@@ -292,7 +312,7 @@ run_perf_test() {
 
     # Run enterprise-typical workload: 5KB messages, 3k msg/s target, 2 publishers, 2 consumers
     output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 2 \
@@ -346,7 +366,7 @@ run_perf_test() {
 echo "=============================================="
 echo "  Criterion 4: Latency Sweep Test"
 echo "=============================================="
-echo "  Target Host:   $HOST"
+echo "  Target Host:   $HOSTS"
 echo "  Test Duration: ${TEST_DURATION}s per latency value"
 echo "  Quick Mode:    $QUICK_MODE"
 echo "  Restore After: $RESTORE_LATENCY"
@@ -379,7 +399,7 @@ echo "latency_ms,send_rate_msg_s,recv_rate_msg_s,confirm_min_ms,confirm_med_ms,c
 {
     echo "# Latency Sweep Test Report"
     echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    echo "# Host: $HOST"
+    echo "# Host: $HOSTS"
     echo "# Test Duration: ${TEST_DURATION}s per latency value"
     echo "# Workload: Enterprise-typical (5KB messages, 3k msg/s target)"
     echo "#"

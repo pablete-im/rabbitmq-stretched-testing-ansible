@@ -18,12 +18,12 @@
 #   - Ansible inventory configured
 #
 # Usage:
-#   ./perf-tests/test-resiliency.sh --host 192.168.20.200
-#   ./perf-tests/test-resiliency.sh --host 192.168.20.200 --skip-chaos
+#   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200
+#   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200 --skip-chaos
 #
 # TLS Usage:
-#   ./perf-tests/test-resiliency.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
-#   ./perf-tests/test-resiliency.sh --host 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -33,7 +33,7 @@ TOOLS_DIR="$SCRIPT_DIR/tools"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Defaults
-HOST="10.85.10.234"
+HOSTS="10.85.10.234"
 USER="admin"
 PASSWORD=""
 SKIP_CHAOS=false
@@ -66,7 +66,7 @@ fi
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)            HOST="$2"; shift 2 ;;
+        --hosts)           HOSTS="$2"; shift 2 ;;
         --user)            USER="$2"; shift 2 ;;
         --password)        PASSWORD="$2"; shift 2 ;;
         --ssh-user)        SSH_USER="$2"; shift 2 ;;
@@ -113,8 +113,30 @@ else
     JVM_OPTS=""
 fi
 
-AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${AMQP_PORT}"
-MGMT_URL="${MGMT_PROTOCOL}://${HOST}:${MGMT_PORT}"
+# Helper function to build URI list from comma-separated hosts
+build_uris() {
+    local hosts="$1"
+    local protocol="$2"
+    local port="$3"
+    local user="$4"
+    local password="$5"
+    
+    local uris=""
+    IFS=',' read -ra HOST_ARRAY <<< "$hosts"
+    for host in "${HOST_ARRAY[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        if [[ -n "$uris" ]]; then
+            uris="${uris},"
+        fi
+        uris="${uris}${protocol}://${user}:${password}@${host}:${port}"
+    done
+    echo "$uris"
+}
+
+AMQP_URIS=$(build_uris "$HOSTS" "$AMQP_PROTOCOL" "$AMQP_PORT" "$USER" "$PASSWORD")
+# For management API, we'll use the first host
+FIRST_HOST=$(echo "$HOSTS" | cut -d',' -f1 | xargs)
+MGMT_URL="${MGMT_PROTOCOL}://${FIRST_HOST}:${MGMT_PORT}"
 
 # --- Helper functions ---
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -492,7 +514,7 @@ test_quorum_leader_failover() {
     # Create quorum queue with messages
     log_info "  Creating quorum queue and publishing messages..."
     java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 1 \
@@ -579,7 +601,7 @@ test_message_durability() {
     # Publish messages with confirms (ensures durability)
     log_info "  Publishing durable messages..."
     java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 1 \
@@ -632,7 +654,7 @@ test_message_durability() {
     log_info "  Consuming messages..."
     local consume_output
     consume_output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --queue "$queue" \
         --quorum-queue \
         --producers 0 \
@@ -707,7 +729,7 @@ test_network_partition() {
     # Create queue and publish messages
     log_info "  Setting up test queue..."
     java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 1 \
@@ -781,7 +803,7 @@ test_split_brain_partition() {
     # Create queue and publish messages
     log_info "  Setting up test queue..."
     java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 1 \
@@ -863,7 +885,7 @@ test_packet_loss_resilience() {
 
     local baseline_output
     baseline_output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "$queue" \
         --producers 2 \
@@ -905,7 +927,7 @@ test_packet_loss_resilience() {
     log_info "  Running throughput test under packet loss..."
     local output
     output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --quorum-queue \
         --queue "resiliency-packet-loss" \
         --producers 2 \
@@ -946,7 +968,7 @@ test_packet_loss_resilience() {
 echo "=============================================="
 echo "  Criterion 2: Core Resiliency Features Test"
 echo "=============================================="
-echo "  Target Host: $HOST"
+echo "  Target Host: $HOSTS"
 echo "  Skip Chaos:  $SKIP_CHAOS"
 echo "  Only Chaos:  $ONLY_CHAOS"
 echo "=============================================="
@@ -971,7 +993,7 @@ TESTS_FAILED=0
 {
     echo "# Core Resiliency Features Test"
     echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    echo "# Host: $HOST"
+    echo "# Host: $HOSTS"
     echo "# Skip Chaos: $SKIP_CHAOS"
     echo "# Only Chaos: $ONLY_CHAOS"
     echo "#"

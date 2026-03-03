@@ -14,12 +14,12 @@
 #   6. Quorum queue replication
 #
 # Usage:
-#   ./perf-tests/test-core-features.sh --host 10.85.10.234
-#   ./perf-tests/test-core-features.sh --host 10.85.10.234 --verbose
+#   ./perf-tests/test-core-features.sh --hosts 10.85.10.234
+#   ./perf-tests/test-core-features.sh --hosts 10.85.10.234 --verbose
 #
 # TLS Usage:
-#   ./perf-tests/test-core-features.sh --host 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
-#   ./perf-tests/test-core-features.sh --host 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-core-features.sh --hosts 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
+#   ./perf-tests/test-core-features.sh --hosts 10.85.10.234 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
 
@@ -28,7 +28,7 @@ TOOLS_DIR="$SCRIPT_DIR/tools"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
 # Defaults
-HOST="10.85.10.234"
+HOSTS="10.85.10.234"
 USER="admin"
 PASSWORD=""
 VERBOSE=false
@@ -54,7 +54,7 @@ fi
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)            HOST="$2"; shift 2 ;;
+        --hosts)           HOSTS="$2"; shift 2 ;;
         --user)            USER="$2"; shift 2 ;;
         --password)        PASSWORD="$2"; shift 2 ;;
         --verbose)         VERBOSE=true; shift ;;
@@ -96,8 +96,30 @@ else
     JVM_OPTS=""
 fi
 
-AMQP_URI="${AMQP_PROTOCOL}://${USER}:${PASSWORD}@${HOST}:${AMQP_PORT}"
-MGMT_URL="${MGMT_PROTOCOL}://${HOST}:${MGMT_PORT}"
+# Helper function to build URI list from comma-separated hosts
+build_uris() {
+    local hosts="$1"
+    local protocol="$2"
+    local port="$3"
+    local user="$4"
+    local password="$5"
+    
+    local uris=""
+    IFS=',' read -ra HOST_ARRAY <<< "$hosts"
+    for host in "${HOST_ARRAY[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        if [[ -n "$uris" ]]; then
+            uris="${uris},"
+        fi
+        uris="${uris}${protocol}://${user}:${password}@${host}:${port}"
+    done
+    echo "$uris"
+}
+
+AMQP_URIS=$(build_uris "$HOSTS" "$AMQP_PROTOCOL" "$AMQP_PORT" "$USER" "$PASSWORD")
+# For management API, we'll use the first host
+FIRST_HOST=$(echo "$HOSTS" | cut -d',' -f1 | xargs)
+MGMT_URL="${MGMT_PROTOCOL}://${FIRST_HOST}:${MGMT_PORT}"
 
 # --- Helper functions ---
 log_info() {
@@ -149,12 +171,12 @@ run_perf_test() {
     local test_name="$1"
     local extra_args="${2:-}"
 
-    verbose "Running: perf-test --uri $AMQP_URI --time $TEST_DURATION $extra_args"
+    verbose "Running: perf-test --uris $AMQP_URIS --time $TEST_DURATION $extra_args"
 
     local output
     local exit_code=0
     output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
-        --uri "$AMQP_URI" \
+        --uris "$AMQP_URIS" \
         --time "$TEST_DURATION" \
         --id "$test_name" \
         --queue "core-test-${test_name}" \
@@ -287,7 +309,7 @@ test_message_ordering() {
 echo "=============================================="
 echo "  Criterion 1: Core Broker Features Test"
 echo "=============================================="
-echo "  Host:     $HOST"
+echo "  Host:     $HOSTS"
 echo "  Duration: ${TEST_DURATION}s per test"
 echo "=============================================="
 echo ""
@@ -303,7 +325,7 @@ TESTS_FAILED=0
 {
     echo "# Core Broker Features Test"
     echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    echo "# Host: $HOST"
+    echo "# Host: $HOSTS"
     echo "#"
     echo ""
 } > "$RESULT_FILE"
