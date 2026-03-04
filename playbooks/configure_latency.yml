@@ -132,6 +132,62 @@
           {{ result }}
           {% endfor %}
 
+    - name: Parse TC qdisc information
+      ansible.builtin.shell: |
+        tc qdisc show dev {{ ansible_default_ipv4.interface }} | while read line; do
+          if [[ "$line" =~ qdisc\ prio\ 1: ]]; then
+            echo "🎯 Root: Priority qdisc (4 bands)"
+          elif [[ "$line" =~ qdisc\ netem\ ([0-9]+): ]]; then
+            band="${BASH_REMATCH[1]}"
+            if [[ "$line" =~ delay\ ([0-9.]+[a-z]+) ]] && [[ "$line" =~ loss\ ([0-9]+%) ]]; then
+              echo "📊 Band $band: ${BASH_REMATCH[1]} delay + ${BASH_REMATCH[2]} loss"
+            elif [[ "$line" =~ delay\ ([0-9.]+[a-z]+) ]]; then
+              echo "⏱️  Band $band: ${BASH_REMATCH[1]} delay"
+            elif [[ "$line" =~ loss\ ([0-9]+%) ]]; then
+              echo "📉 Band $band: ${BASH_REMATCH[1]} loss only"
+            fi
+          fi
+        done
+      register: tc_qdisc_parsed
+      changed_when: false
+
+    - name: Parse TC filter information
+      ansible.builtin.shell: |
+        tc filter show dev {{ ansible_default_ipv4.interface }} | awk '
+        /flowid 1:[0-9]+/ {
+          match($0, /flowid 1:([0-9]+)/, arr)
+          flowid = arr[1]
+        }
+        /^[[:space:]]+match [0-9a-f]{8}\/ffffffff/ && flowid != "" {
+          match($0, /match ([0-9a-f]{8})/, arr)
+          hex = arr[1]
+          ip1 = strtonum("0x" substr(hex, 1, 2))
+          ip2 = strtonum("0x" substr(hex, 3, 2))
+          ip3 = strtonum("0x" substr(hex, 5, 2))
+          ip4 = strtonum("0x" substr(hex, 7, 2))
+          print ip1 "." ip2 "." ip3 "." ip4 " → Band " flowid
+        }
+        END {
+          if (NR == 0 || flowid == "") {
+            print "(Only default routing - no custom filters)"
+          }
+        }'
+      register: tc_filters_parsed
+      changed_when: false
+
+    - name: Format TC configuration summary
+      ansible.builtin.set_fact:
+        node_tc_formatted: |
+          📊 TC Configuration:
+          {% for line in tc_qdisc_parsed.stdout_lines %}
+             {{ line }}
+          {% endfor %}
+          
+          🔀 Active Filters:
+          {% for line in tc_filters_parsed.stdout_lines %}
+             {{ line }}
+          {% endfor %}
+
 - name: Generate Latency Matrix Report
   hosts: localhost
   gather_facts: true
@@ -263,3 +319,26 @@
     - name: Display CSV file location
       ansible.builtin.debug:
         msg: "Detailed CSV report saved to: /tmp/network_latency_matrix.csv"
+
+    - name: Initialize TC summary lines
+      ansible.builtin.set_fact:
+        tc_summary_lines: 
+          - ""
+          - "================================================================================"
+          - "NETWORK CONFIGURATION SUMMARY"
+          - "================================================================================"
+          - ""
+
+    - name: Build TC configuration lines for each node
+      ansible.builtin.set_fact:
+        tc_summary_lines: "{{ tc_summary_lines + ['🖥️  NODE: ' + item] + hostvars[item]['node_tc_formatted'].split('\n') + [''] }}"
+      loop: "{{ groups['nodes'] | sort }}"
+      when: hostvars[item]['node_tc_formatted'] is defined
+
+    - name: Add TC summary footer
+      ansible.builtin.set_fact:
+        tc_summary_lines: "{{ tc_summary_lines + ['================================================================================'] }}"
+
+    - name: Display TC Configuration Summary
+      ansible.builtin.debug:
+        msg: "{{ tc_summary_lines }}"
