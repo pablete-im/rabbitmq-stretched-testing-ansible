@@ -44,9 +44,9 @@ TRUSTSTORE_PASS=""
 TRUSTSTORE_TYPE="JKS"
 
 # Cluster nodes (AZ-Cluster-1)
-NODE1_HOST="10.85.10.234"  # node1 in AZ1
-NODE2_HOST="10.85.10.235"  # node1 in AZ2
-NODE3_HOST="10.85.10.236"  # node1 in AZ3
+NODE1_HOST="10.85.10.234"  # node1
+NODE2_HOST="10.85.10.235"  # node2
+NODE3_HOST="10.85.10.236"  # node3
 
 # Colors for terminal output (disabled when piped/redirected)
 if [[ -t 1 ]]; then
@@ -325,49 +325,105 @@ apply_packet_loss() {
 
     log_info "  Applying ${loss_pct} packet loss on $node ($iface)..."
 
-    # Check for existing Ansible config (Metro/Band 2 usually has handle 20: or just 20:)
+    # Check current TC configuration
     local qdisc_show
     qdisc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
     
-    # Debug output to understand why detection fails
-    log_info "  Current TC config: $(echo "$qdisc_show" | tr '\n' ' ')"
+    # Show current state in a nice format
+    format_tc_output "$node" "$iface" "Current TC configuration"
 
-    # Check for band 20 (can appear as 'qdisc netem 20:' or 'handle 20:')
+    # Check for existing netem 20 (Metro/Cross-region latency band)
     if echo "$qdisc_show" | grep -qE "(qdisc netem 20:|handle 20:)"; then
-        # Extract existing delay parameters
-        # Grep ONLY the line for band 20 first
-        local band_line
-        band_line=$(echo "$qdisc_show" | grep -oP '(qdisc|class) netem 20:.*')
+        log_info "  Found existing netem 20 band, checking if traffic is routed to it"
         
-        local delay_params
-        # Extract delay and jitter (e.g., "delay 1.5ms 500us" or "delay 1.5ms")
-        delay_params=$(echo "$band_line" | grep -oP 'delay [0-9.]+(ms|us)(\s+[0-9.]+(ms|us))?')
+        # Check if there are filters directing traffic to band 20 (flowid 1:2)
+        local filter_show
+        filter_show=$(ssh_cmd "$node" "tc filter show dev $iface")
         
-        if [[ -z "$delay_params" ]]; then
-             # Fallback
-             delay_params=$(echo "$band_line" | sed -n 's/.*\(delay [0-9.]\+ms\(\s\+[0-9.]\+ms\)\?\).*/\1/p')
-        fi
+        if echo "$filter_show" | grep -q "flowid 1:2"; then
+            log_info "  Traffic is already routed to band 20, adding packet loss to existing band"
+            
+            # Extract existing delay parameters from band 20
+            local band_line
+            band_line=$(echo "$qdisc_show" | grep -oP '(qdisc|class) netem 20:.*')
+            
+            local delay_params
+            # Extract delay and jitter (e.g., "delay 1.5ms 500us" or "delay 1.5ms")
+            delay_params=$(echo "$band_line" | grep -oP 'delay [0-9.]+(ms|us)(\s+[0-9.]+(ms|us))?')
+            
+            if [[ -z "$delay_params" ]]; then
+                 # Fallback
+                 delay_params=$(echo "$band_line" | sed -n 's/.*\(delay [0-9.]\+ms\(\s\+[0-9.]\+ms\)\?\).*/\1/p')
+            fi
 
-        log_info "  Detected existing latency config: $delay_params"
+            log_info "  Detected existing latency config: $delay_params"
+            
+            # Modify existing qdisc: keep delay, add loss
+            ssh_sudo "$node" "tc qdisc change dev $iface parent 1:2 handle 20: netem $delay_params loss $loss_pct" || \
+                log_error "Failed to modify existing TC rule"
+        else
+            log_info "  Band 20 exists but no traffic routed to it (same AZ scenario)"
+            log_info "  Creating dedicated packet-loss-only band to avoid adding latency"
+            
+            # Create a new band (40) with ONLY packet loss (no latency)
+            ssh_sudo "$node" "tc qdisc add dev $iface parent 1:4 handle 40: netem loss $loss_pct" || \
+                log_error "Failed to create packet-loss-only band 40"
+            
+            # Get the other cluster node IPs to create filters
+            local cluster_ips=("$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST")
+            local target_node_ip="$node"
+            
+            # Create temporary filters to route traffic between cluster nodes to the new band 40
+            for ip in "${cluster_ips[@]}"; do
+                if [[ "$ip" != "$target_node_ip" ]]; then
+                    log_info "  Adding temporary filter for $ip -> band 40 (packet loss only)"
+                    ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 2 u32 match ip dst $ip/32 flowid 1:4" 2>/dev/null || \
+                        log_warn "Failed to add filter for $ip"
+                fi
+            done
+            
+            log_info "  Created packet-loss-only band 40 with temporary filters (no latency added)"
+        fi
+    
+    elif echo "$qdisc_show" | grep -qE "qdisc prio 1:"; then
+        log_info "  Found prio qdisc structure, creating temporary packet loss band"
         
-        # Modify existing qdisc: keep delay, add loss
-        ssh_sudo "$node" "tc qdisc change dev $iface parent 1:2 handle 20: netem $delay_params loss $loss_pct" || \
-            log_error "Failed to modify existing TC rule"
+        # Strategy: Create a new band and use tc filter to redirect traffic to it
+        # This is more surgical than changing priomap
+        
+        # Add netem qdisc to band 3 (handle 30:)
+        ssh_sudo "$node" "tc qdisc add dev $iface parent 1:3 handle 30: netem loss $loss_pct" || \
+            log_error "Failed to create netem band 30"
+        
+        # Add a filter to redirect traffic from RabbitMQ ports to the packet loss band
+        # RabbitMQ typically uses ports 5672 (AMQP), 15672 (HTTP), 25672 (clustering)
+        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip dport 5672 0xffff flowid 1:3" 2>/dev/null || true
+        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip sport 5672 0xffff flowid 1:3" 2>/dev/null || true
+        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip dport 25672 0xffff flowid 1:3" 2>/dev/null || true
+        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip sport 25672 0xffff flowid 1:3" 2>/dev/null || true
+        
+        log_info "  Created packet loss band 30 with RabbitMQ port filters"
+    
     else
-        # No existing config, add root netem
-        log_info "  No existing TC config detected, adding root rule"
+        log_info "  No prio structure found, creating root netem for packet loss"
+        
+        # No existing structure, try to add root netem
         local tc_output
         tc_output=$(ssh_sudo "$node" "tc qdisc add dev $iface root netem loss $loss_pct 2>&1 || tc qdisc change dev $iface root netem loss $loss_pct 2>&1")
         
         if [[ $? -ne 0 ]]; then
-            log_error "Failed to add TC rule: $tc_output"
+            log_error "Failed to add root TC rule: $tc_output"
+            
+            # Last resort: try to replace whatever is there
+            log_info "  Attempting to replace existing root qdisc"
+            ssh_sudo "$node" "tc qdisc del dev $iface root 2>/dev/null || true"
+            ssh_sudo "$node" "tc qdisc add dev $iface root netem loss $loss_pct" || \
+                log_error "Failed to create any packet loss rule"
         fi
     fi
     
-    # Verify TC configuration
-    local verify_tc
-    verify_tc=$(ssh_cmd "$node" "tc qdisc show dev $iface")
-    log_info "  TC Config after apply: $verify_tc"
+    # Show final configuration in a nice format
+    format_tc_output "$node" "$iface" "TC configuration after applying packet loss"
 }
 
 # Remove packet loss preserving existing latency
@@ -380,25 +436,93 @@ remove_packet_loss() {
     local qdisc_show
     qdisc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
 
-    if echo "$qdisc_show" | grep -qE "(qdisc netem 20:|handle 20:)"; then
-        # Extract existing delay parameters
-        # Grep ONLY the line for band 20 first
+    # First check for our dedicated packet-loss-only band 40 (same AZ scenario)
+    if echo "$qdisc_show" | grep -qE "(qdisc netem 40:|handle 40:)"; then
+        log_info "  Found dedicated packet-loss-only band 40, removing it"
+        
+        # Remove temporary filters first (prio 2 filters to flowid 1:4)
+        local filter_show
+        filter_show=$(ssh_cmd "$node" "tc filter show dev $iface")
+        
+        if echo "$filter_show" | grep -q "pref 2.*flowid 1:4"; then
+            log_info "  Removing temporary filters for band 40"
+            ssh_sudo "$node" "tc filter del dev $iface protocol ip parent 1: prio 2 2>/dev/null" || \
+                log_warn "Failed to remove temporary filters"
+        fi
+        
+        # Remove the dedicated packet-loss-only band
+        ssh_sudo "$node" "tc qdisc del dev $iface parent 1:4 handle 40: 2>/dev/null" || \
+            log_warn "Failed to remove netem band 40"
+        
+        log_info "  Removed packet-loss-only band 40 and temporary filters"
+    
+    # Check for netem 20 with packet loss (different AZ scenario)
+    elif echo "$qdisc_show" | grep -qE "(qdisc netem 20:|handle 20:)"; then
         local band_line
         band_line=$(echo "$qdisc_show" | grep -oP '(qdisc|class) netem 20:.*')
         
-        local delay_params
-        # Extract delay and jitter
-        delay_params=$(echo "$band_line" | grep -oP 'delay [0-9.]+(ms|us)(\s+[0-9.]+(ms|us))?')
+        if echo "$band_line" | grep -q "loss"; then
+            log_info "  Found netem 20 with packet loss, restoring original config"
+            
+            # Extract existing delay parameters, remove loss
+            local delay_params
+            delay_params=$(echo "$band_line" | grep -oP 'delay [0-9.]+(ms|us)(\s+[0-9.]+(ms|us))?')
+            
+            if [[ -n "$delay_params" ]]; then
+                log_info "  Restoring latency config: $delay_params"
+                
+                # Modify qdisc: restore delay, remove loss
+                ssh_sudo "$node" "tc qdisc change dev $iface parent 1:2 handle 20: netem $delay_params" || \
+                    log_warn "Failed to restore original netem 20 config"
+            else
+                log_info "  Removing packet loss from band 20 (no delay to restore)"
+                ssh_sudo "$node" "tc qdisc change dev $iface parent 1:2 handle 20: netem" || \
+                    log_warn "Failed to clean netem 20 config"
+            fi
+            
+            # Check if we added temporary filters (prio 2 filters to flowid 1:2)
+            local filter_show
+            filter_show=$(ssh_cmd "$node" "tc filter show dev $iface")
+            
+            if echo "$filter_show" | grep -q "pref 2.*flowid 1:2"; then
+                log_info "  Removing temporary filters for band 20 packet loss test"
+                
+                # Remove our temporary filters (prio 2)
+                ssh_sudo "$node" "tc filter del dev $iface protocol ip parent 1: prio 2 2>/dev/null" || \
+                    log_warn "Failed to remove temporary filters"
+            fi
+        else
+            log_info "  Band 20 found but no packet loss configured"
+        fi
+    
+    elif echo "$qdisc_show" | grep -qE "(qdisc netem 30:|handle 30:)"; then
+        log_info "  Found dedicated packet loss band 30, removing it"
         
-        log_info "  Restoring latency config: $delay_params"
+        # Remove tc filters first
+        ssh_sudo "$node" "tc filter del dev $iface protocol ip parent 1: prio 1 2>/dev/null" || true
         
-        # Modify qdisc: restore delay, remove loss
-        ssh_sudo "$node" "tc qdisc change dev $iface parent 1:2 handle 20: netem $delay_params" || true
+        # Remove the dedicated packet loss band
+        ssh_sudo "$node" "tc qdisc del dev $iface parent 1:3 handle 30: 2>/dev/null" || \
+            log_warn "Failed to remove netem band 30"
+        
+        log_info "  Removed dedicated packet loss band and filters"
+    
+    elif echo "$qdisc_show" | grep -q "root.*netem.*loss"; then
+        log_info "  Found root netem with packet loss, removing it"
+        
+        # Check if there was any original configuration we should restore
+        # For now, just remove the root netem entirely
+        ssh_sudo "$node" "tc qdisc del dev $iface root 2>/dev/null" || \
+            log_warn "Failed to remove root netem rule"
+        
+        log_info "  Removed root packet loss rule"
+    
     else
-        # No Ansible config, clean root
-        log_info "  Cleaning root TC rule"
-        ssh_sudo "$node" "tc qdisc del dev $iface root 2>/dev/null" || true
+        log_info "  No packet loss configuration found to remove"
     fi
+    
+    # Show final state after cleanup in a nice format
+    format_tc_output "$node" "$iface" "TC configuration after cleanup"
 }
 
 # --- Cleanup functions ---
@@ -444,6 +568,73 @@ cleanup() {
 }
 
 trap cleanup EXIT INT TERM
+
+# Helper function to format TC output nicely
+format_tc_output() {
+    local node="$1"
+    local iface="$2"
+    local title="$3"
+    
+    log_info "  $title:"
+    
+    # Show qdisc rules in a clean format
+    local qdisc_show
+    qdisc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ qdisc\ netem\ ([0-9]+):.*delay\ ([0-9.]+[a-z]+).*loss\ ([0-9]+%) ]]; then
+            log_info "    📊 Band ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} delay + ${BASH_REMATCH[3]} loss"
+        elif [[ "$line" =~ qdisc\ netem\ ([0-9]+):.*delay\ ([0-9.]+[a-z]+) ]]; then
+            log_info "    ⏱️  Band ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} delay"
+        elif [[ "$line" =~ qdisc\ netem\ ([0-9]+):.*loss\ ([0-9]+%) ]]; then
+            log_info "    📉 Band ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} loss only"
+        elif [[ "$line" =~ qdisc\ prio\ 1: ]]; then
+            log_info "    🎯 Root: Priority qdisc (4 bands)"
+        fi
+    done <<< "$qdisc_show"
+    
+    # Show relevant filters with decoded IPs
+    local filter_show
+    filter_show=$(ssh_cmd "$node" "tc filter show dev $iface")
+    
+    local has_filters=false
+    local filter_output=""
+    local current_flowid=""
+    
+    while IFS= read -r line; do
+        # Look for flowid in the filter line
+        if [[ "$line" =~ flowid\ 1:([0-9]+) ]]; then
+            current_flowid="${BASH_REMATCH[1]}"
+        # Look for match in the next line (indented)
+        elif [[ "$line" =~ ^[[:space:]]+match\ ([0-9a-f]{8})/ffffffff ]] && [[ -n "$current_flowid" ]]; then
+            if [[ "$has_filters" == "false" ]]; then
+                filter_output+="    🔀 Filters:\n"
+                has_filters=true
+            fi
+            
+            local hex_ip="${BASH_REMATCH[1]}"
+            local band="$current_flowid"
+            
+            # Decode hex IP to dotted decimal
+            local ip1=$((0x${hex_ip:0:2}))
+            local ip2=$((0x${hex_ip:2:2}))
+            local ip3=$((0x${hex_ip:4:2}))
+            local ip4=$((0x${hex_ip:6:2}))
+            local decoded_ip="$ip1.$ip2.$ip3.$ip4"
+            
+            filter_output+="       $decoded_ip → Band $band\n"
+            current_flowid=""  # Reset for next filter
+        fi
+    done <<< "$filter_show"
+    
+    if [[ "$has_filters" == "true" ]]; then
+        echo -e "$filter_output" | while IFS= read -r line; do
+            [[ -n "$line" ]] && log_info "$line"
+        done
+    else
+        log_info "    🔀 Filters: (only default routing)"
+    fi
+}
 
 # Check packet loss to a node
 check_packet_loss() {
@@ -968,7 +1159,7 @@ test_packet_loss_resilience() {
 echo "=============================================="
 echo "  Criterion 2: Core Resiliency Features Test"
 echo "=============================================="
-echo "  Target Host: $HOSTS"
+echo "  Target Hosts: $HOSTS"
 echo "  Skip Chaos:  $SKIP_CHAOS"
 echo "  Only Chaos:  $ONLY_CHAOS"
 echo "=============================================="

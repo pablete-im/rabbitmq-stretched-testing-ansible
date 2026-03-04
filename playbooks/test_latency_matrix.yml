@@ -21,6 +21,14 @@
       ansible.builtin.set_fact:
         node_latency_data: "{{ latency_results.stdout_lines }}"
 
+    - name: Display latency results for this node
+      ansible.builtin.debug:
+        msg: |
+          Latency results from {{ inventory_hostname }}:
+          {% for result in latency_results.stdout_lines %}
+          {{ result }}
+          {% endfor %}
+
 - name: Generate Latency Matrix Report
   hosts: localhost
   gather_facts: true

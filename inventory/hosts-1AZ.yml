@@ -12,14 +12,14 @@ all:
 
     # ============================================
     # Region: Arizona
-    # 3 Availability Zones (~3ms metro)
+    # 1 Availability Zone (minimum latency between cluster nodes)
     # ============================================
     arizona:
       children:
         az-cluster-1:
         az-cluster-2:
 
-    # AZ-Cluster-1: 3 nodes (one per AZ)
+    # AZ-Cluster-1: 3 nodes (all in same AZ)
     az-cluster-1:
       vars:
         rmq_cluster_name: az-cluster-1
@@ -30,12 +30,12 @@ all:
           az_group: az_az1
         pve-schwab-rmq02:
           ansible_host: 10.85.10.235
-          az_group: az_az2
+          az_group: az_az1
         pve-schwab-rmq03:
           ansible_host: 10.85.10.236
-          az_group: az_az3
+          az_group: az_az1
 
-    # AZ-Cluster-2: 3 nodes (one per AZ)
+    # AZ-Cluster-2: 3 nodes (all in same AZ)
     az-cluster-2:
       vars:
         rmq_cluster_name: az-cluster-2
@@ -46,10 +46,10 @@ all:
           az_group: az_az1
         pve-schwab-rmq05:
           ansible_host: 10.85.10.242
-          az_group: az_az2
+          az_group: az_az1
         pve-schwab-rmq06:
           ansible_host: 10.85.10.243
-          az_group: az_az3
+          az_group: az_az1
 
     # ============================================
     # Region: Texas
@@ -59,7 +59,7 @@ all:
       children:
         tx-cluster-1:
 
-    # TX-Cluster-1: 3 nodes (one per AZ)
+    # TX-Cluster-1: 3 nodes (all in same AZ)
     tx-cluster-1:
       vars:
         rmq_cluster_name: tx-cluster-1
@@ -70,36 +70,10 @@ all:
           az_group: tx_az1
         pve-schwab-rmq08:
           ansible_host: 10.85.10.245
-          az_group: tx_az2
+          az_group: tx_az1
         pve-schwab-rmq09:
           ansible_host: 10.85.10.246
-          az_group: tx_az3
-
-    # ============================================
-    # AZ Groups (for latency rules if needed)
-    # ============================================
-    az_az1:
-      hosts:
-        pve-schwab-rmq01:
-        pve-schwab-rmq04:
-    az_az2:
-      hosts:
-        pve-schwab-rmq02:
-        pve-schwab-rmq05:
-    az_az3:
-      hosts:
-        pve-schwab-rmq03:
-        pve-schwab-rmq06:
-    
-    tx_az1:
-      hosts:
-        pve-schwab-rmq07:
-    tx_az2:
-      hosts:
-        pve-schwab-rmq08:
-    tx_az3:
-      hosts:
-        pve-schwab-rmq09:
+          az_group: tx_az1
 
     # Localhost for control tasks
     control:
