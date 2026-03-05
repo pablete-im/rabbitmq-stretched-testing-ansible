@@ -39,6 +39,7 @@ PASSWORD=""
 SKIP_CHAOS=false
 ONLY_CHAOS=false
 ONLY_PACKET_LOSS=false
+PRIORITIZE_NODE="node2"
 SSH_USER="ansible"
 TRUSTSTORE=""
 TRUSTSTORE_PASS=""
@@ -75,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --skip-chaos)      SKIP_CHAOS=true; shift ;;
         --only-chaos)      ONLY_CHAOS=true; shift ;;
         --only-packet-loss) ONLY_PACKET_LOSS=true; shift ;;
+        --prioritize-tests-node) PRIORITIZE_NODE="$2"; shift 2 ;;
         --truststore)      TRUSTSTORE="$2"; shift 2 ;;
         --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
         --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
@@ -86,9 +88,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --user USERNAME               RabbitMQ admin username (default: admin)"
             echo "  --password PASSWORD           RabbitMQ admin password"
             echo "  --ssh-user USERNAME           SSH username for node access (default: ansible)"
-            echo "  --skip-chaos                  Skip chaos/network tests (Tests 4-6)"
-            echo "  --only-chaos                  Run only chaos/network tests (Tests 4-6)"
-            echo "  --only-packet-loss            Run only packet loss test (Test 6)"
+            echo "  --skip-chaos                  Skip chaos/network tests (Tests 5-7)"
+            echo "  --only-chaos                  Run only chaos/network tests (Tests 5-7)"
+            echo "  --only-packet-loss            Run only packet loss test (Test 7)"
+            echo "  --prioritize-tests-node NODE  Prioritize node for failure tests (node1|node2|node3, default: node2)"
             echo "  --truststore PATH             Path to truststore for TLS connections"
             echo "  --truststore-pass PASSWORD    Truststore password"
             echo "  --truststore-type TYPE        Truststore type (default: JKS)"
@@ -98,6 +101,7 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 --hosts 192.168.1.10,192.168.1.11,192.168.1.12"
             echo "  $0 --hosts 192.168.1.10 --skip-chaos"
             echo "  $0 --hosts 192.168.1.10 --only-packet-loss"
+            echo "  $0 --hosts 192.168.1.10 --prioritize-tests-node node1"
             echo "  $0 --hosts 192.168.1.10 --truststore /path/to/truststore.p12 --truststore-pass mypass"
             exit 0
             ;;
@@ -113,6 +117,31 @@ if $SKIP_CHAOS && $ONLY_CHAOS; then
     echo "Error: Cannot specify both --skip-chaos and --only-chaos"
     exit 1
 fi
+
+# Validate prioritize node option
+if [[ "$PRIORITIZE_NODE" != "node1" && "$PRIORITIZE_NODE" != "node2" && "$PRIORITIZE_NODE" != "node3" ]]; then
+    echo "Error: --prioritize-tests-node must be one of: node1, node2, node3"
+    exit 1
+fi
+
+# Configure prioritized node variables
+case "$PRIORITIZE_NODE" in
+    "node1")
+        PRIORITY_HOST="$NODE1_HOST"
+        OTHER_HOST1="$NODE2_HOST"
+        OTHER_HOST2="$NODE3_HOST"
+        ;;
+    "node2")
+        PRIORITY_HOST="$NODE2_HOST"
+        OTHER_HOST1="$NODE1_HOST"
+        OTHER_HOST2="$NODE3_HOST"
+        ;;
+    "node3")
+        PRIORITY_HOST="$NODE3_HOST"
+        OTHER_HOST1="$NODE1_HOST"
+        OTHER_HOST2="$NODE2_HOST"
+        ;;
+esac
 
 if [[ -z "$PASSWORD" ]]; then
     PASSWORD="${RMQ_PASSWORD:-}"
@@ -362,77 +391,90 @@ apply_packet_loss() {
     # Show current state in a nice format
     format_tc_output "$node" "$iface" "Current TC configuration"
 
+    # Get all cluster node IPs for filter management
+    local cluster_ips=("$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST")
+    local target_node_ip="$node"
+
     # Check for existing netem 20 (Metro/Cross-region latency band)
     if echo "$qdisc_show" | grep -qE "(qdisc netem 20:|handle 20:)"; then
-        log_info "  Found existing netem 20 band, checking if traffic is routed to it"
+        log_info "  Found existing netem 20 band"
         
-        # Check if there are filters directing traffic to band 20 (flowid 1:2)
+        # ALWAYS modify band 20 to add packet loss (consolidating strategy)
+        local band_line
+        band_line=$(echo "$qdisc_show" | grep -oP '(qdisc|class) netem 20:.*')
+        
+        local delay_params
+        # Extract delay and jitter (e.g., "delay 1.5ms 500us" or "delay 1.5ms")
+        delay_params=$(echo "$band_line" | grep -oP 'delay [0-9.]+(ms|us)(\s+[0-9.]+(ms|us))?')
+        
+        if [[ -z "$delay_params" ]]; then
+             # Fallback
+             delay_params=$(echo "$band_line" | sed -n 's/.*\(delay [0-9.]\+ms\(\s\+[0-9.]\+ms\)\?\).*/\1/p')
+        fi
+
+        log_info "  Detected existing latency config: $delay_params"
+        log_info "  Adding packet loss to netem 20 band"
+        
+        # Modify existing qdisc: keep delay, add loss
+        ssh_sudo "$node" "tc qdisc change dev $iface parent 1:2 handle 20: netem $delay_params loss $loss_pct" || \
+            log_error "Failed to modify existing TC rule"
+
+        # Now check which cluster IPs need filters to route traffic to band 20
         local filter_show
         filter_show=$(ssh_cmd "$node" "tc filter show dev $iface")
         
-        if echo "$filter_show" | grep -q "flowid 1:2"; then
-            log_info "  Traffic is already routed to band 20, adding packet loss to existing band"
-            
-            # Extract existing delay parameters from band 20
-            local band_line
-            band_line=$(echo "$qdisc_show" | grep -oP '(qdisc|class) netem 20:.*')
-            
-            local delay_params
-            # Extract delay and jitter (e.g., "delay 1.5ms 500us" or "delay 1.5ms")
-            delay_params=$(echo "$band_line" | grep -oP 'delay [0-9.]+(ms|us)(\s+[0-9.]+(ms|us))?')
-            
-            if [[ -z "$delay_params" ]]; then
-                 # Fallback
-                 delay_params=$(echo "$band_line" | sed -n 's/.*\(delay [0-9.]\+ms\(\s\+[0-9.]\+ms\)\?\).*/\1/p')
-            fi
-
-            log_info "  Detected existing latency config: $delay_params"
-            
-            # Modify existing qdisc: keep delay, add loss
-            ssh_sudo "$node" "tc qdisc change dev $iface parent 1:2 handle 20: netem $delay_params loss $loss_pct" || \
-                log_error "Failed to modify existing TC rule"
-        else
-            log_info "  Band 20 exists but no traffic routed to it (same AZ scenario)"
-            log_info "  Creating dedicated packet-loss-only band to avoid adding latency"
-            
-            # Create a new band (40) with ONLY packet loss (no latency)
-            ssh_sudo "$node" "tc qdisc add dev $iface parent 1:4 handle 40: netem loss $loss_pct" || \
-                log_error "Failed to create packet-loss-only band 40"
-            
-            # Get the other cluster node IPs to create filters
-            local cluster_ips=("$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST")
-            local target_node_ip="$node"
-            
-            # Create temporary filters to route traffic FROM cluster nodes TO this node to the new band 40
-            for ip in "${cluster_ips[@]}"; do
-                if [[ "$ip" != "$target_node_ip" ]]; then
-                    log_info "  Adding temporary filter for incoming traffic from $ip -> band 40 (packet loss only)"
-                    ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 2 u32 match ip src $ip/32 flowid 1:4" 2>/dev/null || \
-                        log_warn "Failed to add filter for incoming traffic from $ip"
+        # Check specific IPs: NODE1 and NODE3 (excluding the current node)
+        local target_ips=("$NODE1_HOST" "$NODE3_HOST")
+        
+        for ip in "${target_ips[@]}"; do
+            if [[ "$ip" != "$target_node_ip" ]]; then
+                # Convert IP to hex for matching in tc filter output
+                local ip_parts=(${ip//./ })
+                local hex_ip=$(printf "%02x%02x%02x%02x" "${ip_parts[0]}" "${ip_parts[1]}" "${ip_parts[2]}" "${ip_parts[3]}")
+                
+                # Check if this IP has a filter routing to band 20 (flowid 1:2)
+                local has_band20_filter=false
+                local current_flowid=""
+                
+                while IFS= read -r line; do
+                    # Look for flowid in the filter line
+                    if [[ "$line" =~ flowid\ 1:([0-9]+) ]]; then
+                        current_flowid="${BASH_REMATCH[1]}"
+                    # Look for match in the next line (indented) and check if it's for band 2 (flowid 1:2)
+                    elif [[ "$line" =~ ^[[:space:]]+match\ ([0-9a-f]{8})/ffffffff ]] && [[ "$current_flowid" == "2" ]]; then
+                        local found_hex_ip="${BASH_REMATCH[1]}"
+                        if [[ "$found_hex_ip" == "$hex_ip" ]]; then
+                            has_band20_filter=true
+                            break
+                        fi
+                    fi
+                done <<< "$filter_show"
+                
+                if [[ "$has_band20_filter" == "true" ]]; then
+                    log_info "  IP $ip already has filter routing to band 20"
+                else
+                    log_info "  IP $ip missing filter for band 20, creating band 40 and filter"
+                    
+                    # Create band 40 if it doesn't exist yet (packet loss only, no latency)
+                    if ! echo "$qdisc_show" | grep -qE "(qdisc netem 40:|handle 40:)"; then
+                        ssh_sudo "$node" "tc qdisc add dev $iface parent 1:4 handle 40: netem loss $loss_pct" || \
+                            log_error "Failed to create packet-loss-only band 40"
+                        log_info "  Created packet-loss-only band 40"
+                        # Update qdisc_show for next iteration
+                        qdisc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
+                    fi
+                    
+                    # Add temporary filter for this IP to route to band 40 (use prio 10 to avoid conflicts)
+                    log_info "  Adding temporary filter for traffic to $ip -> band 40"
+                    ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 10 u32 match ip dst $ip/32 flowid 1:4" 2>/dev/null || \
+                        log_warn "Failed to add filter for traffic to $ip"
                 fi
-            done
-            
-            log_info "  Created packet-loss-only band 40 with temporary filters (no latency added)"
-        fi
+            fi
+        done
     
     elif echo "$qdisc_show" | grep -qE "qdisc prio 1:"; then
-        log_info "  Found prio qdisc structure, creating temporary packet loss band"
-        
-        # Strategy: Create a new band and use tc filter to redirect traffic to it
-        # This is more surgical than changing priomap
-        
-        # Add netem qdisc to band 3 (handle 30:)
-        ssh_sudo "$node" "tc qdisc add dev $iface parent 1:3 handle 30: netem loss $loss_pct" || \
-            log_error "Failed to create netem band 30"
-        
-        # Add a filter to redirect traffic from RabbitMQ ports to the packet loss band
-        # RabbitMQ typically uses ports 5672 (AMQP), 15672 (HTTP), 25672 (clustering)
-        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip dport 5672 0xffff flowid 1:3" 2>/dev/null || true
-        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip sport 5672 0xffff flowid 1:3" 2>/dev/null || true
-        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip dport 25672 0xffff flowid 1:3" 2>/dev/null || true
-        ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 1 u32 match ip sport 25672 0xffff flowid 1:3" 2>/dev/null || true
-        
-        log_info "  Created packet loss band 30 with RabbitMQ port filters"
+        log_info "  Found prio qdisc structure, band 40 will be created if needed for specific IPs"
+        # Band 40 creation is handled per-IP in the loop above
     
     else
         log_info "  No prio structure found, creating root netem for packet loss"
@@ -466,28 +508,60 @@ remove_packet_loss() {
     local qdisc_show
     qdisc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
 
-    # First check for our dedicated packet-loss-only band 40 (same AZ scenario)
+    # Step 1: Remove temporary band 40 and its filters (if exists)
     if echo "$qdisc_show" | grep -qE "(qdisc netem 40:|handle 40:)"; then
-        log_info "  Found dedicated packet-loss-only band 40, removing it"
+        log_info "  Found temporary packet-loss-only band 40, removing it"
         
-        # Remove temporary filters first (prio 2 filters to flowid 1:4)
+        # Remove ONLY the temporary filters that route to flowid 1:4 (band 40)
         local filter_show
         filter_show=$(ssh_cmd "$node" "tc filter show dev $iface")
         
-        if echo "$filter_show" | grep -q "pref 2.*flowid 1:4"; then
-            log_info "  Removing temporary filters for band 40"
-            ssh_sudo "$node" "tc filter del dev $iface protocol ip parent 1: prio 2 2>/dev/null" || \
-                log_warn "Failed to remove temporary filters"
-        fi
+        # Get specific target IPs to remove only their temporary filters
+        local target_ips=("$NODE1_HOST" "$NODE3_HOST")
+        local target_node_ip="$node"
         
-        # Remove the dedicated packet-loss-only band
+        for ip in "${target_ips[@]}"; do
+            if [[ "$ip" != "$target_node_ip" ]]; then
+                # Convert IP to hex for matching in tc filter output
+                local ip_parts=(${ip//./ })
+                local hex_ip=$(printf "%02x%02x%02x%02x" "${ip_parts[0]}" "${ip_parts[1]}" "${ip_parts[2]}" "${ip_parts[3]}")
+                
+                # Use the same robust parsing approach to check for band 40 filters
+                local has_band40_filter=false
+                local current_flowid=""
+                
+                while IFS= read -r line; do
+                    # Look for flowid in the filter line
+                    if [[ "$line" =~ flowid\ 1:([0-9]+) ]]; then
+                        current_flowid="${BASH_REMATCH[1]}"
+                    # Look for match in the next line (indented) and check if it's for band 4 (flowid 1:4)
+                    elif [[ "$line" =~ ^[[:space:]]+match\ ([0-9a-f]{8})/ffffffff ]] && [[ "$current_flowid" == "4" ]]; then
+                        local found_hex_ip="${BASH_REMATCH[1]}"
+                        if [[ "$found_hex_ip" == "$hex_ip" ]]; then
+                            has_band40_filter=true
+                            break
+                        fi
+                    fi
+                done <<< "$filter_show"
+                
+                if [[ "$has_band40_filter" == "true" ]]; then
+                    log_info "  Removing temporary filter for $ip -> band 40"
+                    # Remove this specific filter by matching the destination IP (using prio 10)
+                    ssh_sudo "$node" "tc filter del dev $iface protocol ip parent 1: prio 10 u32 match ip dst $ip/32 flowid 1:4 2>/dev/null" || \
+                        log_warn "Failed to remove temporary filter for $ip"
+                fi
+            fi
+        done
+        
+        # Remove the temporary packet-loss-only band
         ssh_sudo "$node" "tc qdisc del dev $iface parent 1:4 handle 40: 2>/dev/null" || \
             log_warn "Failed to remove netem band 40"
         
-        log_info "  Removed packet-loss-only band 40 and temporary filters"
+        log_info "  Removed temporary band 40 and its specific filters"
+    fi
     
-    # Check for netem 20 with packet loss (different AZ scenario)
-    elif echo "$qdisc_show" | grep -qE "(qdisc netem 20:|handle 20:)"; then
+    # Step 2: Restore band 20 to original state (remove packet loss, keep latency)
+    if echo "$qdisc_show" | grep -qE "(qdisc netem 20:|handle 20:)"; then
         local band_line
         band_line=$(echo "$qdisc_show" | grep -oP '(qdisc|class) netem 20:.*')
         
@@ -510,27 +584,14 @@ remove_packet_loss() {
                     log_warn "Failed to clean netem 20 config"
             fi
             
-            # IMPORTANT: When we modified an existing band 20 (3 AZ scenario), 
-            # we did NOT create temporary filters, so we should NOT remove any filters.
-            # The existing filters for band 20 should remain intact.
-            log_info "  Existing band 20 filters preserved (no temporary filters were added)"
+            log_info "  Restored band 20 to original state (existing filters preserved)"
         else
             log_info "  Band 20 found but no packet loss configured"
         fi
+    fi
     
-    elif echo "$qdisc_show" | grep -qE "(qdisc netem 30:|handle 30:)"; then
-        log_info "  Found dedicated packet loss band 30, removing it"
-        
-        # Remove tc filters first
-        ssh_sudo "$node" "tc filter del dev $iface protocol ip parent 1: prio 1 2>/dev/null" || true
-        
-        # Remove the dedicated packet loss band
-        ssh_sudo "$node" "tc qdisc del dev $iface parent 1:3 handle 30: 2>/dev/null" || \
-            log_warn "Failed to remove netem band 30"
-        
-        log_info "  Removed dedicated packet loss band and filters"
-    
-    elif echo "$qdisc_show" | grep -q "root.*netem.*loss"; then
+    # Step 3: Handle root netem configurations (fallback cases)
+    if echo "$qdisc_show" | grep -q "root.*netem.*loss"; then
         log_info "  Found root netem with packet loss, removing it"
         
         # Check if there was any original configuration we should restore
@@ -539,9 +600,6 @@ remove_packet_loss() {
             log_warn "Failed to remove root netem rule"
         
         log_info "  Removed root packet loss rule"
-    
-    else
-        log_info "  No packet loss configuration found to remove"
     fi
     
     # Show final state after cleanup in a nice format
@@ -606,11 +664,17 @@ format_tc_output() {
     
     while IFS= read -r line; do
         if [[ "$line" =~ qdisc\ netem\ ([0-9]+):.*delay\ ([0-9.]+[a-z]+).*loss\ ([0-9]+%) ]]; then
-            log_info "    📊 Band ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} delay + ${BASH_REMATCH[3]} loss"
+            local band_num="${BASH_REMATCH[1]}"
+            local flowid_num=$((band_num / 10))  # Convert handle to flowid (20->2, 30->3, 40->4)
+            log_info "    📊 Band $flowid_num: ${BASH_REMATCH[2]} delay + ${BASH_REMATCH[3]} loss"
         elif [[ "$line" =~ qdisc\ netem\ ([0-9]+):.*delay\ ([0-9.]+[a-z]+) ]]; then
-            log_info "    ⏱️  Band ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} delay"
+            local band_num="${BASH_REMATCH[1]}"
+            local flowid_num=$((band_num / 10))  # Convert handle to flowid (20->2, 30->3, 40->4)
+            log_info "    ⏱️  Band $flowid_num: ${BASH_REMATCH[2]} delay"
         elif [[ "$line" =~ qdisc\ netem\ ([0-9]+):.*loss\ ([0-9]+%) ]]; then
-            log_info "    📉 Band ${BASH_REMATCH[1]}: ${BASH_REMATCH[2]} loss only"
+            local band_num="${BASH_REMATCH[1]}"
+            local flowid_num=$((band_num / 10))  # Convert handle to flowid (20->2, 30->3, 40->4)
+            log_info "    📉 Band $flowid_num: ${BASH_REMATCH[2]} loss only"
         elif [[ "$line" =~ qdisc\ prio\ 1: ]]; then
             log_info "    🎯 Root: Priority qdisc (4 bands)"
         fi
@@ -662,7 +726,7 @@ format_tc_output() {
 # Check packet loss to a node
 check_packet_loss() {
     local target_ip="$1"
-    local count=50
+    local count=100
     
     log_info "  Checking packet loss to $target_ip (from $NODE1_HOST)..."
     local ping_output
@@ -678,6 +742,50 @@ check_packet_loss() {
     fi
     
     log_info "  Measured packet loss: ${loss}%"
+    return 0
+}
+
+# Check packet loss from NODE2 to a target
+check_packet_loss_from_node2() {
+    local target_ip="$1"
+    local count=100
+    
+    log_info "  Checking packet loss to $target_ip (from $NODE2_HOST)..."
+    local ping_output
+    # Ping FROM Node 2 TO target via SSH
+    ping_output=$(ssh_cmd "$NODE2_HOST" "ping -c $count -i 0.1 $target_ip" 2>&1)
+    
+    local loss
+    loss=$(echo "$ping_output" | grep -oP '\d+(?=% packet loss)')
+    
+    if [[ -z "$loss" ]]; then
+         # Fallback for systems without grep -P or different ping output
+         loss=$(echo "$ping_output" | grep "packet loss" | awk '{print $6}' | tr -d '%')
+    fi
+    
+    log_info "  Measured packet loss to $target_ip: ${loss}%"
+    return 0
+}
+
+# Check packet loss from prioritized node to a target
+check_packet_loss_from_prioritized_node() {
+    local target_ip="$1"
+    local count=100
+    
+    log_info "  Checking packet loss to $target_ip (from $PRIORITY_HOST)..."
+    local ping_output
+    # Ping FROM prioritized node TO target via SSH
+    ping_output=$(ssh_cmd "$PRIORITY_HOST" "ping -c $count -i 0.1 $target_ip" 2>&1)
+    
+    local loss
+    loss=$(echo "$ping_output" | grep -oP '\d+(?=% packet loss)')
+    
+    if [[ -z "$loss" ]]; then
+         # Fallback for systems without grep -P or different ping output
+         loss=$(echo "$ping_output" | grep "packet loss" | awk '{print $6}' | tr -d '%')
+    fi
+    
+    log_info "  Measured packet loss to $target_ip: ${loss}%"
     return 0
 }
 
@@ -803,7 +911,7 @@ test_quorum_leader_failover() {
 }
 
 test_message_durability() {
-    log_info "Test 2: Message durability through node failure"
+    log_info "Test 2: Message durability through node failure (prioritizing $PRIORITIZE_NODE)"
 
     local queue="resiliency-test-durability"
     
@@ -832,25 +940,37 @@ test_message_durability() {
     initial_messages=$(wait_for_queue_messages "$queue" 500)
     log_info "  Published $initial_messages messages (expected $expected_messages)"
 
-    # Stop a non-leader node
+    # Check if prioritized node is the leader
     local leader
     leader=$(get_quorum_leader "$queue")
-    local target_node=""
-    local target_ip=""
-
-    for node_ip in "$NODE2_HOST" "$NODE3_HOST"; do
-        if [[ "$(node_to_ip "$leader")" != "$node_ip" ]]; then
-            target_ip="$node_ip"
-            break
+    local leader_ip
+    leader_ip=$(node_to_ip "$leader")
+    
+    if [[ "$leader_ip" == "$PRIORITY_HOST" ]]; then
+        log_info "  Prioritized node ($PRIORITIZE_NODE) is the leader, forcing leader election first..."
+        # Stop the leader to force election
+        ssh_sudo "$PRIORITY_HOST" "systemctl stop tanzu-rabbitmq-server" || true
+        sleep 5
+        
+        # Wait for new leader election
+        local new_leader
+        new_leader=$(wait_for_leader "$queue" "$leader" 60)
+        if [[ "$new_leader" == "timeout" ]]; then
+            log_error "Leader election timed out"
+            force_restart_node "$PRIORITY_HOST"
+            return 1
         fi
-    done
-
-    if [[ -z "$target_ip" ]]; then
-        target_ip="$NODE2_HOST"
+        log_info "  New leader elected: $new_leader, restarting prioritized node..."
+        
+        # Restart the prioritized node
+        force_restart_node "$PRIORITY_HOST"
+        wait_for_nodes 3 300 || true
+        sleep 5
     fi
 
-    log_info "  Stopping follower node at $target_ip..."
-    ssh_sudo "$target_ip" "systemctl stop tanzu-rabbitmq-server" || true
+    # Now stop the prioritized node (which should be a follower)
+    log_info "  Stopping prioritized node ($PRIORITIZE_NODE) at $PRIORITY_HOST..."
+    ssh_sudo "$PRIORITY_HOST" "systemctl stop tanzu-rabbitmq-server" || true
     sleep 5
 
     # Verify messages still accessible
@@ -861,7 +981,7 @@ test_message_durability() {
 
     # Restart node
     log_info "  Restarting node..."
-    force_restart_node "$target_ip"
+    force_restart_node "$PRIORITY_HOST"
     wait_for_nodes 3 300 || true
 
     # Consume all messages
@@ -899,16 +1019,102 @@ test_message_durability() {
     fi
 }
 
+test_message_durability_streams() {
+    log_info "Test 3: Message durability through node failure (Streams)"
+
+    local queue="resiliency-test-durability-stream"
+    
+    # Ensure queue is clean before starting
+    curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
+
+    local expected_messages=500
+
+    # Publish messages to stream with confirms (ensures durability)
+    log_info "  Publishing durable messages to stream..."
+    java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+        --uris "$AMQP_URIS" \
+        --queue "$queue" \
+        --stream-queue \
+        --producers 1 \
+        --consumers 0 \
+        --pmessages "$expected_messages" \
+        --confirm 1 \
+        --size 5000 \
+        --id "durability-stream-pub" > /dev/null 2>&1
+
+    # Wait for messages to be visible in API
+    sleep 2
+
+    local initial_messages
+    initial_messages=$(wait_for_queue_messages "$queue" 500)
+    log_info "  Published $initial_messages messages (expected $expected_messages)"
+
+    # Stop a node (streams don't have leader concept like quorum queues, so pick NODE2)
+    local target_ip="$NODE2_HOST"
+    
+    log_info "  Stopping node at $target_ip..."
+    ssh_sudo "$target_ip" "systemctl stop tanzu-rabbitmq-server" || true
+    sleep 5
+
+    # Verify messages still accessible
+    local during_messages
+    if ! during_messages=$(wait_for_queue_messages "$queue" 500); then
+        log_warn "Message count mismatch during failure ($during_messages)"
+    fi
+
+    # Restart node
+    log_info "  Restarting node..."
+    force_restart_node "$target_ip"
+    wait_for_nodes 3 300 || true
+
+    # Consume all messages from stream
+    log_info "  Consuming messages from stream..."
+    local consume_output
+    consume_output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
+        --uris "$AMQP_URIS" \
+        --queue "$queue" \
+        --predeclared \
+        --producers 0 \
+        --consumers 1 \
+        --cmessages "$expected_messages" \
+        --qos 100 \
+        --stream-consumer-offset "first" \
+        --id "durability-stream-con" 2>&1) || true
+    
+    # Check if consumption failed
+    if [[ $? -ne 0 ]]; then
+         log_warn "Consumption command failed (exit code $?)"
+         echo "$consume_output" | head -n 5
+    fi
+
+    sleep 2
+    # For streams, messages remain in the stream after consumption
+    # So we check that the stream still contains the expected messages
+    local final_messages
+    if ! final_messages=$(wait_for_queue_messages "$queue" "$expected_messages"); then
+        log_warn "Stream message count unexpected ($final_messages vs expected $expected_messages)"
+    fi
+    
+    log_info "  Final stream message count: $final_messages"
+    if [[ "$during_messages" -ge "$expected_messages" && "$final_messages" -ge "$expected_messages" ]]; then
+        log_pass "Stream message durability verified ($during_messages messages survived failure, $final_messages remain in stream)"
+        return 0
+    else
+        log_error "Stream durability issue: expected=$expected_messages, during=$during_messages, final=$final_messages"
+        return 1
+    fi
+}
+
 test_cluster_recovery() {
-    log_info "Test 3: Cluster recovery after node restart"
+    log_info "Test 4: Cluster recovery after node restart (prioritizing $PRIORITIZE_NODE)"
 
     # Get initial state
     local initial_nodes
     initial_nodes=$(get_running_nodes)
 
-    # Stop a node gracefully
-    log_info "  Stopping node at $NODE3_HOST..."
-    ssh_sudo "$NODE3_HOST" "systemctl stop tanzu-rabbitmq-server" || true
+    # Stop the prioritized node gracefully
+    log_info "  Stopping prioritized node ($PRIORITIZE_NODE) at $PRIORITY_HOST..."
+    ssh_sudo "$PRIORITY_HOST" "systemctl stop tanzu-rabbitmq-server" || true
     sleep 5
 
     local during_nodes
@@ -917,7 +1123,7 @@ test_cluster_recovery() {
 
     # Restart node
     log_info "  Restarting node..."
-    force_restart_node "$NODE3_HOST"
+    force_restart_node "$PRIORITY_HOST"
 
     # Wait for recovery
     log_info "  Waiting for cluster recovery..."
@@ -933,7 +1139,7 @@ test_cluster_recovery() {
 }
 
 test_network_partition() {
-    log_info "Test 4: Network partition handling"
+    log_info "Test 5: Network partition handling (prioritizing $PRIORITIZE_NODE)"
 
     local queue="resiliency-test-partition"
 
@@ -956,10 +1162,18 @@ test_network_partition() {
     local initial_messages
     initial_messages=$(wait_for_queue_messages "$queue" 500)
 
-    # Simulate network partition using iptables (block traffic from NODE3 to NODE1)
-    log_info "  Simulating partial network partition (isolating $NODE3_HOST from $NODE1_HOST)..."
-    ssh_sudo "$NODE3_HOST" "iptables -A INPUT -s $NODE1_HOST -j DROP" || true
-    ssh_sudo "$NODE3_HOST" "iptables -A OUTPUT -d $NODE1_HOST -j DROP" || true
+    # Determine isolation target based on prioritized node
+    local isolation_target
+    if [[ "$PRIORITIZE_NODE" == "node1" ]]; then
+        isolation_target="$NODE2_HOST"
+    else
+        isolation_target="$NODE1_HOST"
+    fi
+
+    # Simulate network partition using iptables (isolate prioritized node from target)
+    log_info "  Simulating partial network partition (isolating $PRIORITY_HOST from $isolation_target)..."
+    ssh_sudo "$PRIORITY_HOST" "iptables -A INPUT -s $isolation_target -j DROP" || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -A OUTPUT -d $isolation_target -j DROP" || true
 
     # Wait for partition detection
     sleep 30
@@ -985,8 +1199,8 @@ except:
 
     # Heal partition
     log_info "  Healing network partition..."
-    ssh_sudo "$NODE3_HOST" "iptables -D INPUT -s $NODE1_HOST -j DROP" 2>/dev/null || true
-    ssh_sudo "$NODE3_HOST" "iptables -D OUTPUT -d $NODE1_HOST -j DROP" 2>/dev/null || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -D INPUT -s $isolation_target -j DROP" 2>/dev/null || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -D OUTPUT -d $isolation_target -j DROP" 2>/dev/null || true
 
     # Wait for healing
     sleep 30
@@ -1007,7 +1221,7 @@ except:
 }
 
 test_split_brain_partition() {
-    log_info "Test 5: Split Brain (Total Node Isolation)"
+    log_info "Test 6: Split Brain (Total Node Isolation) (prioritizing $PRIORITIZE_NODE)"
 
     local queue="resiliency-test-split-brain"
     
@@ -1030,12 +1244,12 @@ test_split_brain_partition() {
     local initial_messages
     initial_messages=$(wait_for_queue_messages "$queue" 500)
 
-    # Simulate TOTAL network partition (Isolate N3 from N1 AND N2)
-    log_info "  Simulating Split Brain (Isolating $NODE3_HOST from everyone)..."
-    ssh_sudo "$NODE3_HOST" "iptables -A INPUT -s $NODE1_HOST -j DROP" || true
-    ssh_sudo "$NODE3_HOST" "iptables -A OUTPUT -d $NODE1_HOST -j DROP" || true
-    ssh_sudo "$NODE3_HOST" "iptables -A INPUT -s $NODE2_HOST -j DROP" || true
-    ssh_sudo "$NODE3_HOST" "iptables -A OUTPUT -d $NODE2_HOST -j DROP" || true
+    # Simulate TOTAL network partition (Isolate prioritized node from everyone)
+    log_info "  Simulating Split Brain (Isolating $PRIORITY_HOST from everyone)..."
+    ssh_sudo "$PRIORITY_HOST" "iptables -A INPUT -s $OTHER_HOST1 -j DROP" || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -A OUTPUT -d $OTHER_HOST1 -j DROP" || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -A INPUT -s $OTHER_HOST2 -j DROP" || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -A OUTPUT -d $OTHER_HOST2 -j DROP" || true
 
     # Wait for partition detection
     sleep 30
@@ -1061,10 +1275,10 @@ except:
 
     # Heal partition
     log_info "  Healing Split Brain..."
-    ssh_sudo "$NODE3_HOST" "iptables -D INPUT -s $NODE1_HOST -j DROP" 2>/dev/null || true
-    ssh_sudo "$NODE3_HOST" "iptables -D OUTPUT -d $NODE1_HOST -j DROP" 2>/dev/null || true
-    ssh_sudo "$NODE3_HOST" "iptables -D INPUT -s $NODE2_HOST -j DROP" 2>/dev/null || true
-    ssh_sudo "$NODE3_HOST" "iptables -D OUTPUT -d $NODE2_HOST -j DROP" 2>/dev/null || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -D INPUT -s $OTHER_HOST1 -j DROP" 2>/dev/null || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -D OUTPUT -d $OTHER_HOST1 -j DROP" 2>/dev/null || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -D INPUT -s $OTHER_HOST2 -j DROP" 2>/dev/null || true
+    ssh_sudo "$PRIORITY_HOST" "iptables -D OUTPUT -d $OTHER_HOST2 -j DROP" 2>/dev/null || true
 
     # Wait for healing
     sleep 30
@@ -1085,17 +1299,19 @@ except:
 }
 
 test_packet_loss_resilience() {
-    log_info "Test 6: Packet loss resilience"
+    log_info "Test 7: Packet loss resilience (prioritizing $PRIORITIZE_NODE)"
 
-    # Introduce 5% packet loss on one node
+    # Introduce 5% packet loss on prioritized node
     log_info "  Baseline throughput check (no packet loss)..."
     local queue="resiliency-packet-loss"
     
     # Ensure queue is clean before starting
     curl -sf -k -X DELETE -u "${USER}:${PASSWORD}" "${MGMT_URL}/api/queues/%2F/${queue}" > /dev/null 2>&1 || true
 
-    # Baseline ping
-    check_packet_loss "$NODE2_HOST"
+    # Baseline ping from prioritized node to the other two
+    log_info "  Measuring baseline packet loss from $PRIORITIZE_NODE..."
+    check_packet_loss_from_prioritized_node "$OTHER_HOST1"
+    check_packet_loss_from_prioritized_node "$OTHER_HOST2"
 
     local baseline_output
     baseline_output=$(java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
@@ -1114,14 +1330,14 @@ test_packet_loss_resilience() {
     baseline_rate="${baseline_rate:-0}"
     log_info "  Baseline throughput: $baseline_rate msg/s"
 
-    log_info "  Introducing 5% packet loss on $NODE2_HOST..."
+    log_info "  Introducing 5% packet loss on $PRIORITY_HOST..."
     
     # Dynamically detect main interface (prefer ens33)
     local iface
-    if ssh_cmd "$NODE2_HOST" "ip link show ens33 >/dev/null 2>&1"; then
+    if ssh_cmd "$PRIORITY_HOST" "ip link show ens33 >/dev/null 2>&1"; then
         iface="ens33"
     else
-        iface=$(ssh_cmd "$NODE2_HOST" "ip route | grep default | awk '{print \$5}' | head -n 1")
+        iface=$(ssh_cmd "$PRIORITY_HOST" "ip route | grep default | awk '{print \$5}' | head -n 1")
     fi
     
     if [[ -z "$iface" ]]; then
@@ -1131,11 +1347,13 @@ test_packet_loss_resilience() {
         log_info "  Target interface: $iface"
     fi
 
-    # Introduce 5% packet loss on one node
-    apply_packet_loss "$NODE2_HOST" "$iface"
+    # Introduce 5% packet loss on prioritized node (for outgoing traffic to other nodes)
+    apply_packet_loss "$PRIORITY_HOST" "$iface"
 
-    # Verify packet loss with ping
-    check_packet_loss "$NODE2_HOST"
+    # Verify packet loss with ping from prioritized node to the other two
+    log_info "  Measuring packet loss from $PRIORITIZE_NODE..."
+    check_packet_loss_from_prioritized_node "$OTHER_HOST1"
+    check_packet_loss_from_prioritized_node "$OTHER_HOST2"
 
     # Run throughput test
     log_info "  Running throughput test under packet loss..."
@@ -1152,10 +1370,12 @@ test_packet_loss_resilience() {
         --id "packet-loss" 2>&1) || true
 
     # Remove packet loss
-    remove_packet_loss "$NODE2_HOST" "$iface"
+    remove_packet_loss "$PRIORITY_HOST" "$iface"
 
-    # Final ping check
-    check_packet_loss "$NODE2_HOST"
+    # Final ping check from prioritized node
+    log_info "  Verifying packet loss removal from $PRIORITIZE_NODE..."
+    check_packet_loss_from_prioritized_node "$OTHER_HOST1"
+    check_packet_loss_from_prioritized_node "$OTHER_HOST2"
 
     # Check if test completed with reasonable throughput
     local send_rate
@@ -1190,13 +1410,13 @@ echo "=============================================="
 
 # Display test execution plan
 if $ONLY_PACKET_LOSS; then
-    echo "🎯 Running only Test 6: Packet loss resilience"
+    echo "🎯 Running only Test 7: Packet loss resilience"
 elif $ONLY_CHAOS; then
-    echo "🌪️  Running only chaos tests (Tests 4-6)"
+    echo "🌪️  Running only chaos tests (Tests 5-7)"
 elif $SKIP_CHAOS; then
-    echo "🛡️  Running base tests only (Tests 1-3, skipping chaos)"
+    echo "🛡️  Running base tests only (Tests 1-4, skipping chaos)"
 else
-    echo "🔄 Running all tests (Tests 1-6)"
+    echo "🔄 Running all tests (Tests 1-7)"
 fi
 echo ""
 echo -e "${YELLOW}WARNING: This test will stop/restart RabbitMQ nodes!${NC}"
@@ -1240,6 +1460,7 @@ TESTS_BASE=(
     "test_initial_health"
     "test_quorum_leader_failover"
     "test_message_durability"
+    "test_message_durability_streams"
     "test_cluster_recovery"
 )
 

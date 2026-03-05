@@ -45,7 +45,8 @@
           if [[ "$line" =~ qdisc\ prio\ 1: ]]; then
             echo "🎯 Root: Priority qdisc (4 bands)"
           elif [[ "$line" =~ qdisc\ netem\ ([0-9]+): ]]; then
-            band="${BASH_REMATCH[1]}"
+            handle="${BASH_REMATCH[1]}"
+            band=$((handle / 10))  # Convert handle to flowid (20->2, 30->3, 40->4)
             if [[ "$line" =~ delay\ ([0-9.]+[a-z]+) ]] && [[ "$line" =~ loss\ ([0-9]+%) ]]; then
               echo "📊 Band $band: ${BASH_REMATCH[1]} delay + ${BASH_REMATCH[2]} loss"
             elif [[ "$line" =~ delay\ ([0-9.]+[a-z]+) ]]; then
