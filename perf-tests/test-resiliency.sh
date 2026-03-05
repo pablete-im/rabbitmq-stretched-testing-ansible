@@ -20,9 +20,9 @@
 # Usage:
 #   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200
 #   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200 --skip-chaos
+#   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200 --only-packet-loss
 #
 # TLS Usage:
-#   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
 #   ./perf-tests/test-resiliency.sh --hosts 192.168.20.200 --truststore /path/to/truststore.p12 --truststore-pass mypass
 # =============================================================================
 set -euo pipefail
@@ -38,10 +38,12 @@ USER="admin"
 PASSWORD=""
 SKIP_CHAOS=false
 ONLY_CHAOS=false
+ONLY_PACKET_LOSS=false
 SSH_USER="ansible"
 TRUSTSTORE=""
 TRUSTSTORE_PASS=""
 TRUSTSTORE_TYPE="JKS"
+
 
 # Cluster nodes (AZ-Cluster-1)
 NODE1_HOST="10.85.10.234"  # node1
@@ -72,10 +74,38 @@ while [[ $# -gt 0 ]]; do
         --ssh-user)        SSH_USER="$2"; shift 2 ;;
         --skip-chaos)      SKIP_CHAOS=true; shift ;;
         --only-chaos)      ONLY_CHAOS=true; shift ;;
+        --only-packet-loss) ONLY_PACKET_LOSS=true; shift ;;
         --truststore)      TRUSTSTORE="$2"; shift 2 ;;
         --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
         --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
-        *)                 echo "Unknown option: $1"; exit 1 ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --hosts HOST1[,HOST2,...]     Comma-separated list of RabbitMQ hosts"
+            echo "  --user USERNAME               RabbitMQ admin username (default: admin)"
+            echo "  --password PASSWORD           RabbitMQ admin password"
+            echo "  --ssh-user USERNAME           SSH username for node access (default: ansible)"
+            echo "  --skip-chaos                  Skip chaos/network tests (Tests 4-6)"
+            echo "  --only-chaos                  Run only chaos/network tests (Tests 4-6)"
+            echo "  --only-packet-loss            Run only packet loss test (Test 6)"
+            echo "  --truststore PATH             Path to truststore for TLS connections"
+            echo "  --truststore-pass PASSWORD    Truststore password"
+            echo "  --truststore-type TYPE        Truststore type (default: JKS)"
+            echo "  -h, --help                    Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0 --hosts 192.168.1.10,192.168.1.11,192.168.1.12"
+            echo "  $0 --hosts 192.168.1.10 --skip-chaos"
+            echo "  $0 --hosts 192.168.1.10 --only-packet-loss"
+            echo "  $0 --hosts 192.168.1.10 --truststore /path/to/truststore.p12 --truststore-pass mypass"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
     esac
 done
 
@@ -373,12 +403,12 @@ apply_packet_loss() {
             local cluster_ips=("$NODE1_HOST" "$NODE2_HOST" "$NODE3_HOST")
             local target_node_ip="$node"
             
-            # Create temporary filters to route traffic between cluster nodes to the new band 40
+            # Create temporary filters to route traffic FROM cluster nodes TO this node to the new band 40
             for ip in "${cluster_ips[@]}"; do
                 if [[ "$ip" != "$target_node_ip" ]]; then
-                    log_info "  Adding temporary filter for $ip -> band 40 (packet loss only)"
-                    ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 2 u32 match ip dst $ip/32 flowid 1:4" 2>/dev/null || \
-                        log_warn "Failed to add filter for $ip"
+                    log_info "  Adding temporary filter for incoming traffic from $ip -> band 40 (packet loss only)"
+                    ssh_sudo "$node" "tc filter add dev $iface protocol ip parent 1: prio 2 u32 match ip src $ip/32 flowid 1:4" 2>/dev/null || \
+                        log_warn "Failed to add filter for incoming traffic from $ip"
                 fi
             done
             
@@ -480,17 +510,10 @@ remove_packet_loss() {
                     log_warn "Failed to clean netem 20 config"
             fi
             
-            # Check if we added temporary filters (prio 2 filters to flowid 1:2)
-            local filter_show
-            filter_show=$(ssh_cmd "$node" "tc filter show dev $iface")
-            
-            if echo "$filter_show" | grep -q "pref 2.*flowid 1:2"; then
-                log_info "  Removing temporary filters for band 20 packet loss test"
-                
-                # Remove our temporary filters (prio 2)
-                ssh_sudo "$node" "tc filter del dev $iface protocol ip parent 1: prio 2 2>/dev/null" || \
-                    log_warn "Failed to remove temporary filters"
-            fi
+            # IMPORTANT: When we modified an existing band 20 (3 AZ scenario), 
+            # we did NOT create temporary filters, so we should NOT remove any filters.
+            # The existing filters for band 20 should remain intact.
+            log_info "  Existing band 20 filters preserved (no temporary filters were added)"
         else
             log_info "  Band 20 found but no packet loss configured"
         fi
@@ -1162,7 +1185,19 @@ echo "=============================================="
 echo "  Target Hosts: $HOSTS"
 echo "  Skip Chaos:  $SKIP_CHAOS"
 echo "  Only Chaos:  $ONLY_CHAOS"
+echo "  Only Packet Loss: $ONLY_PACKET_LOSS"
 echo "=============================================="
+
+# Display test execution plan
+if $ONLY_PACKET_LOSS; then
+    echo "🎯 Running only Test 6: Packet loss resilience"
+elif $ONLY_CHAOS; then
+    echo "🌪️  Running only chaos tests (Tests 4-6)"
+elif $SKIP_CHAOS; then
+    echo "🛡️  Running base tests only (Tests 1-3, skipping chaos)"
+else
+    echo "🔄 Running all tests (Tests 1-6)"
+fi
 echo ""
 echo -e "${YELLOW}WARNING: This test will stop/restart RabbitMQ nodes!${NC}"
 echo -e "${YELLOW}Ensure this is a test/lab environment.${NC}"
@@ -1187,6 +1222,7 @@ TESTS_FAILED=0
     echo "# Host: $HOSTS"
     echo "# Skip Chaos: $SKIP_CHAOS"
     echo "# Only Chaos: $ONLY_CHAOS"
+    echo "# Only Packet Loss: $ONLY_PACKET_LOSS"
     echo "#"
     echo ""
 } > "$RESULT_FILE"
@@ -1215,13 +1251,16 @@ TESTS_CHAOS=(
 
 TESTS_TO_RUN=()
 
-if $ONLY_CHAOS; then
+if $ONLY_PACKET_LOSS; then
+    TESTS_TO_RUN=("test_packet_loss_resilience")
+elif $ONLY_CHAOS; then
     TESTS_TO_RUN=("${TESTS_CHAOS[@]}")
 elif $SKIP_CHAOS; then
     TESTS_TO_RUN=("${TESTS_BASE[@]}")
 else
     TESTS_TO_RUN=("${TESTS_BASE[@]}" "${TESTS_CHAOS[@]}")
 fi
+
 
 for test_func in "${TESTS_TO_RUN[@]}"; do
     echo ""
