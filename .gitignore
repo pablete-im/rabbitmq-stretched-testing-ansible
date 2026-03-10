@@ -22,6 +22,9 @@ venv/
 perf-tests/results/*.txt
 perf-tests/results/*.txt.consumer
 perf-tests/results/*.csv
+perf-tests/results/csv/*.csv
+perf-tests/results/plots/*.png
+perf-tests/results/*.txt.consumer
 perf-tests/tools/
 
 # IDE
