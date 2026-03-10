@@ -7,7 +7,7 @@ description: "Baseline test - 1 pub, 1 con, 1KB messages"
 type: amqp
 
 # Test duration
-duration: 60
+duration: 120
 
 # Publisher settings
 publishers: 1
@@ -19,8 +19,10 @@ consumer_rate: 0  # 0 = unlimited
 
 # Message settings
 message_size: 1000  # 1KB
-confirm: true
-multi_ack_every: 100
+confirm: 100        # Publisher confirmation frequency (integer)
+multi_ack_every: 100  # Consumer acknowledgment frequency (mutually exclusive with autoack)
+# autoack: true     # Auto-acknowledge messages (true/false, mutually exclusive with multi_ack_every)
+qos: 200             # Consumer prefetch count
 
 # Queue settings
 queue_type: quorum  # classic, quorum, or stream

@@ -152,11 +152,23 @@ CONSUMER_RATE=$(parse_yaml_value "consumer_rate")
 MESSAGE_SIZE=$(parse_yaml_value "message_size")
 CONFIRM=$(parse_yaml_value "confirm")
 MULTI_ACK=$(parse_yaml_value "multi_ack_every")
+QOS=$(parse_yaml_value "qos")
+AUTOACK=$(parse_yaml_value "autoack")
 QUEUE_TYPE=$(parse_yaml_value "queue_type")
 QUEUE_NAME=$(parse_yaml_value "queue")
 STREAM_NAME=$(parse_yaml_value "stream")
 OFFSET=$(parse_yaml_value "offset")
 TEST_NAME=$(parse_yaml_value "name")
+
+# --- Validation ---
+# Check for mutually exclusive options
+if [[ "${AUTOACK:-}" == "true" && -n "${MULTI_ACK:-}" ]]; then
+    echo "Error: 'autoack' and 'multi_ack_every' are mutually exclusive options."
+    echo "  autoack: ${AUTOACK:-unset}"
+    echo "  multi_ack_every: ${MULTI_ACK:-unset}"
+    echo "Please specify only one of these options in your scenario file."
+    exit 1
+fi
 
 # --- Prepare result output ---
 mkdir -p "$RESULTS_DIR"
@@ -220,7 +232,9 @@ else
     [[ -n "$CONSUMERS" ]] && CMD+=(--consumers "$CONSUMERS")
     [[ -n "$MESSAGE_SIZE" ]] && CMD+=(--size "$MESSAGE_SIZE")
     [[ -n "$MULTI_ACK" ]] && CMD+=(--multi-ack-every "$MULTI_ACK")
-    [[ "$CONFIRM" == "true" ]] && CMD+=(--confirm "$MULTI_ACK")
+    [[ -n "$CONFIRM" ]] && CMD+=(--confirm "$CONFIRM")
+    [[ -n "$QOS" ]] && CMD+=(--qos "$QOS")
+    [[ "${AUTOACK:-}" == "true" ]] && CMD+=(--autoack)
     [[ -n "$PUB_RATE" && "$PUB_RATE" != "0" ]] && CMD+=(--rate "$PUB_RATE")
     [[ -n "$CONSUMER_RATE" && "$CONSUMER_RATE" != "0" ]] && CMD+=(--consumer-rate "$CONSUMER_RATE")
 
@@ -301,7 +315,7 @@ if [[ -n "$CON_HOSTS" ]]; then
         [[ -n "$DURATION" ]] && PRODUCER_CMD+=(--time "$DURATION")
         [[ -n "$MESSAGE_SIZE" ]] && PRODUCER_CMD+=(--size "$MESSAGE_SIZE")
         [[ -n "$PUB_RATE" && "$PUB_RATE" != "0" ]] && PRODUCER_CMD+=(--rate "$PUB_RATE")
-        [[ "$CONFIRM" == "true" ]] && PRODUCER_CMD+=(--confirm "${MULTI_ACK:-1}")
+        [[ -n "$CONFIRM" ]] && PRODUCER_CMD+=(--confirm "$CONFIRM")
         
         # Add queue type for AMQP producer
         case "${QUEUE_TYPE:-quorum}" in
@@ -344,6 +358,8 @@ if [[ -n "$CON_HOSTS" ]]; then
         [[ -n "$DURATION" ]] && CONSUMER_CMD+=(--time "$DURATION")
         [[ -n "$CONSUMER_RATE" && "$CONSUMER_RATE" != "0" ]] && CONSUMER_CMD+=(--consumer-rate "$CONSUMER_RATE")
         [[ -n "$MULTI_ACK" ]] && CONSUMER_CMD+=(--multi-ack-every "$MULTI_ACK")
+        [[ -n "$QOS" ]] && CONSUMER_CMD+=(--qos "$QOS")
+        [[ "${AUTOACK:-}" == "true" ]] && CONSUMER_CMD+=(--autoack)
         
         # Add queue type for AMQP consumer
         case "${QUEUE_TYPE:-quorum}" in

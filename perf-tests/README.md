@@ -358,6 +358,176 @@ perf-tests/
     streams.yml
     federation-test.yml
     enterprise-workload.yml # Enterprise-typical workload
+  plotter/                 # Performance results parser and plotter
+    parse_and_plot.py      # PNG plot generator
+    parse_to_csv.py        # CSV data exporter
+    install_dependencies.sh # Dependency installer
+    requirements.txt       # Python dependencies
   results/                 # Test output (git-ignored)
   tools/                   # Downloaded JARs (git-ignored)
 ```
+
+---
+
+## Performance Test Results Parser and Plotter
+
+This set of scripts parses RabbitMQ performance test results and generates line graphs or exports CSV data for different metrics across multiple test runs.
+
+### Available Scripts
+
+1. **`plotter/parse_and_plot.py`** - Generates PNG plots directly (requires matplotlib)
+2. **`plotter/parse_to_csv.py`** - Exports data to CSV for use with Excel/Google Sheets (no dependencies)
+3. **`plotter/install_dependencies.sh`** - Automatic dependency installation script
+
+### Quick Installation
+
+```bash
+# Run automatic installation script
+./plotter/install_dependencies.sh
+```
+
+#### Manual Dependency Installation
+
+Only needed for `plotter/parse_and_plot.py`:
+
+##### Option 1: Using apt (recommended for Debian/Ubuntu systems)
+```bash
+sudo apt update
+sudo apt install python3-matplotlib python3-numpy
+```
+
+##### Option 2: Using pip with virtual environment
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install matplotlib numpy
+```
+
+##### Option 3: Using pip with --break-system-packages (not recommended)
+```bash
+pip3 install matplotlib numpy --break-system-packages
+```
+
+### Usage
+
+#### Option 1: Generate PNG Plots (requires matplotlib)
+
+```bash
+python3 plotter/parse_and_plot.py <filter> [-n MAX_FILES] [-d RESULTS_DIR]
+```
+
+#### Option 2: Export to CSV (no dependencies)
+
+```bash
+python3 plotter/parse_to_csv.py <filter> [-n MAX_FILES] [-d RESULTS_DIR]
+```
+
+#### Parameters:
+- `filter`: Filter name to match files (e.g., "baseline")
+- `-n, --max-files`: Maximum number of files to process (newest first)
+- `-d, --results-dir`: Directory containing result files (default: perf-tests/results)
+
+#### Examples:
+
+```bash
+# Generate PNG plots for all "baseline" files
+python3 plotter/parse_and_plot.py baseline
+
+# Export to CSV only the 5 most recent files containing "baseline"
+python3 plotter/parse_to_csv.py baseline -n 5
+
+# Use a different directory
+python3 plotter/parse_and_plot.py baseline -d /path/to/results
+
+# Process files with specific filter
+python3 plotter/parse_to_csv.py max-performance -n 10
+```
+
+### Functionality
+
+The scripts:
+
+1. **Search for files** matching the pattern `*-{filter}.txt*` in the results directory
+2. **Sort by modification date** (newest first)
+3. **Extract scenario name** from the first 5 lines (line starting with "# Scenario:")
+4. **Parse data lines** that start with "id: ..., time ..."
+5. **Extract the following metrics**:
+   - `sent`: Messages sent per second
+   - `confirmed`: Messages confirmed per second  
+   - `received`: Messages received per second
+   - `consumer_latency_median`: Consumer median latency (2nd value from "/" separated string, supports both µs and ms units)
+   - `confirm_latency_median`: Confirm median latency (2nd value from "/" separated string, supports both µs and ms units)
+
+6. **Generate 5 line graphs**, one per metric:
+   - X-axis: Time in seconds
+   - Y-axis: Metric value
+   - One series per parsed file
+
+7. **Save output files**:
+   - **PNG plots**: `results/plots/` with names like:
+     - `{DATE}-{FILTER}-sent.png`
+     - `{DATE}-{FILTER}-confirmed.png`
+     - `{DATE}-{FILTER}-received.png`
+     - `{DATE}-{FILTER}-consumer_latency_median.png`
+     - `{DATE}-{FILTER}-confirm_latency_median.png`
+   - **CSV files**: `results/csv/` with names like:
+     - `{DATE}-{FILTER}-sent.csv`
+     - `{DATE}-{FILTER}-confirmed.csv`
+     - etc.
+
+### Expected Data Format
+
+The scripts expect files with the following format:
+
+```
+# Federation Test - Producer Results
+# Scenario: baseline-5-pub-cons
+# Date: 2026-03-09 14:21:13 UTC
+# Producer Host: 10.85.10.234,10.85.10.235,10.85.10.236
+# Consumer Host: 10.85.10.234,10.85.10.235,10.85.10.236
+...
+id: baseline-1773066073, time 1.001 s, sent: 25996 msg/s, confirmed: 25496 msg/s, nacked: 0 msg/s, min/median/75th/95th/99th/max confirm latency: 6/18/22/29/34/41 ms
+id: baseline-1773066073, time 2.000 s, sent: 28155 msg/s, confirmed: 28155 msg/s, nacked: 0 msg/s, min/median/75th/95th/99th/max confirm latency: 6/17/21/27/29/33 ms
+...
+```
+
+For consumer files:
+```
+id: baseline-1773066073, time 1.001 s, received: 26120 msg/s, min/median/75th/95th/99th/max consumer latency: 7/18/23/34/22650827150373800/22650827161831440 ms
+```
+
+For files with confirm latency:
+```
+id: baseline, time 1.001 s, sent: 8100 msg/s, confirmed: 8000 msg/s, received: 8000 msg/s, min/median/75th/95th/99th/max consumer latency: 6566/9360/10545/13411/15730/16991 µs, confirm latency: 8109/11607/12814/15905/17658/20405 µs
+```
+
+**Note**: The parser automatically detects and handles both microseconds (µs) and milliseconds (ms) units for latency values, converting them to milliseconds in the output.
+
+### Output Files
+
+#### PNG Plots (`plotter/parse_and_plot.py`)
+- Saved in `results/plots/`
+- PNG format with high resolution (300 DPI)
+- One graph per metric with all data series
+- Names: `{DATE}-{FILTER}-{METRIC}.png`
+
+#### CSV Files (`plotter/parse_to_csv.py`)
+- Saved in `results/csv/`
+- CSV format compatible with Excel, Google Sheets, etc.
+- One column per data series, one row per time point
+- Names: `{DATE}-{FILTER}-{METRIC}.csv`
+
+#### CSV Structure
+```csv
+time,20260309-073604-baseline,20260309-073327-baseline,20260309-072816-baseline
+1.001,50933.0,27975.0,3418.0
+2.001,,32718.0,5586.0
+3.001,,32670.0,7711.0
+...
+```
+
+### Use Cases
+
+- **Quick analysis**: Use `plotter/parse_to_csv.py` to export data and create charts in Excel/Google Sheets
+- **Presentations**: Use `plotter/parse_and_plot.py` to generate presentation-ready graphs
+- **Statistical analysis**: Import CSV into R, Python pandas, or specialized tools
