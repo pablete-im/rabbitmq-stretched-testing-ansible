@@ -540,6 +540,50 @@ remove_packet_loss() {
     local qdisc_show
     qdisc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
 
+    # Step 0: Remove ANY orphaned netem rules with packet loss (residuals from previous tests)
+    # These can have arbitrary handles like 8001:, 8002:, etc.
+    local orphaned_handles=()
+    while IFS= read -r line; do
+        # Match any netem qdisc with loss that is NOT handle 20: or 40: (our expected ones)
+        if [[ "$line" =~ qdisc\ netem\ ([0-9]+):.*loss ]] && \
+           [[ "${BASH_REMATCH[1]}" != "20" ]] && \
+           [[ "${BASH_REMATCH[1]}" != "40" ]]; then
+            orphaned_handles+=("${BASH_REMATCH[1]}")
+        fi
+    done <<< "$qdisc_show"
+    
+    if [[ ${#orphaned_handles[@]} -gt 0 ]]; then
+        log_info "  Found ${#orphaned_handles[@]} orphaned netem rule(s) with packet loss from previous tests"
+        for handle in "${orphaned_handles[@]}"; do
+            log_info "  Removing orphaned netem handle ${handle}:"
+            
+            # Try to determine parent and remove appropriately
+            local handle_line
+            handle_line=$(echo "$qdisc_show" | grep "qdisc netem ${handle}:")
+            
+            if echo "$handle_line" | grep -q "root"; then
+                # It's a root qdisc, remove it completely
+                ssh_sudo "$node" "tc qdisc del dev $iface root 2>/dev/null" || \
+                    log_warn "Failed to remove orphaned root netem ${handle}:"
+                log_info "  Removed orphaned root netem ${handle}:"
+            elif [[ "$handle_line" =~ parent\ 1:([0-9]+) ]]; then
+                # It's attached to a prio band
+                local parent_band="${BASH_REMATCH[1]}"
+                ssh_sudo "$node" "tc qdisc del dev $iface parent 1:${parent_band} handle ${handle}: 2>/dev/null" || \
+                    log_warn "Failed to remove orphaned netem ${handle}: from parent 1:${parent_band}"
+                log_info "  Removed orphaned netem ${handle}: from band ${parent_band}"
+            else
+                # Unknown structure, try generic removal
+                ssh_sudo "$node" "tc qdisc del dev $iface handle ${handle}: 2>/dev/null" || \
+                    log_warn "Failed to remove orphaned netem ${handle}:"
+                log_info "  Removed orphaned netem ${handle}:"
+            fi
+        done
+        
+        # Refresh qdisc_show after removing orphaned rules
+        qdisc_show=$(ssh_cmd "$node" "tc qdisc show dev $iface")
+    fi
+
     # Step 1: Remove temporary band 40 and its filters (if exists)
     if echo "$qdisc_show" | grep -qE "(qdisc netem 40:|handle 40:)"; then
         log_info "  Found temporary packet-loss-only band 40, removing it"
