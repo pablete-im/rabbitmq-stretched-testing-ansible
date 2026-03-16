@@ -7,7 +7,7 @@ description: "Stream test - high throughput with replay capability"
 type: stream
 
 # Test duration
-duration: 60
+duration: 30
 
 # Publisher settings
 publishers: 1
@@ -22,3 +22,6 @@ message_size: 1000  # 1KB
 # Stream settings
 stream: perf-test-stream
 offset: first  # Consumers start from beginning
+
+# Queue settings
+queue_type: stream  # classic, quorum, or stream

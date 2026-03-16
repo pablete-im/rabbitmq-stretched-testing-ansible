@@ -20,6 +20,7 @@ venv/
 
 # Performance test results and tools (downloaded JARs)
 perf-tests/results/*.txt
+perf-tests/results/*.omq
 perf-tests/results/*.txt.consumer
 perf-tests/results/*.csv
 perf-tests/results/csv/*.csv

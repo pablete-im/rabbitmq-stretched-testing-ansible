@@ -1,0 +1,36 @@
+# Stream Performance Test with AMQP 1.0 Filtering
+# Tests stream performance with application property filtering (RabbitMQ 4.1+)
+# Publishers send messages with different property values, consumers filter by value
+
+name: stream-filter
+description: "Stream test with AMQP 1.0 filtering - 1 pub, 1 con, mixed keys"
+type: amqp
+
+# Test duration
+duration: 60
+
+# Publisher settings
+publishers: 1
+pub_rate: 100  # 100 msg/s
+
+# Consumer settings
+consumers: 1
+consumer_rate: 0  # 0 = unlimited
+
+# Message settings
+message_size: 1000  # 1KB
+confirm: 50        # Publisher confirmation frequency
+qos: 100           # Consumer prefetch count
+
+# Queue settings
+queue_type: stream  # Use stream queues
+offset: next        # Start consuming from the next message (alternatives: first, last, offset N, timestamp)
+
+# AMQP 1.0 Stream Filtering (RabbitMQ 4.1+)
+# Publisher will send messages with different 'key' property values
+stream_filter_key: key
+stream_filter_values: foo,bar,baz  # Mix of values (roughly equal distribution)
+
+# Consumer will only receive messages where key starts with 'ba' (bar and baz)
+# Expected: ~66% of published messages (bar + baz)
+stream_filter_match_unfiltered: "&p:ba"  # &p: means prefix match

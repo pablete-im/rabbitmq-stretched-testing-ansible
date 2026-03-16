@@ -44,6 +44,18 @@ SSH_USER="ansible"
 TRUSTSTORE=""
 TRUSTSTORE_PASS=""
 TRUSTSTORE_TYPE="JKS"
+OSS_RABBITMQ=false
+
+# RabbitMQ service name (tanzu-rabbitmq-server by default, rabbitmq-server for OSS)
+RMQ_SERVICE="tanzu-rabbitmq-server"
+
+# Systemctl commands (will be updated if --oss-rabbitmq is used)
+RMQ_STOP_CMD="systemctl stop tanzu-rabbitmq-server"
+RMQ_START_CMD="systemctl start tanzu-rabbitmq-server --no-block"
+RMQ_RESTART_CMD="systemctl restart tanzu-rabbitmq-server"
+RMQ_STATUS_CMD="systemctl status tanzu-rabbitmq-server"
+RMQ_RESET_FAILED_CMD="systemctl reset-failed tanzu-rabbitmq-server"
+RMQ_KILL_CMD="systemctl kill -s SIGKILL tanzu-rabbitmq-server"
 
 
 # Cluster nodes (AZ-Cluster-1)
@@ -80,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --truststore)      TRUSTSTORE="$2"; shift 2 ;;
         --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
         --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
+        --oss-rabbitmq)    OSS_RABBITMQ=true; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -92,6 +105,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --only-chaos                  Run only chaos/network tests (Tests 5-7)"
             echo "  --only-packet-loss            Run only packet loss test (Test 7)"
             echo "  --prioritize-tests-node NODE  Prioritize node for failure tests (node1|node2|node3, default: node2)"
+            echo "  --oss-rabbitmq                Use rabbitmq-server instead of tanzu-rabbitmq-server"
             echo "  --truststore PATH             Path to truststore for TLS connections"
             echo "  --truststore-pass PASSWORD    Truststore password"
             echo "  --truststore-type TYPE        Truststore type (default: JKS)"
@@ -102,6 +116,7 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 --hosts 192.168.1.10 --skip-chaos"
             echo "  $0 --hosts 192.168.1.10 --only-packet-loss"
             echo "  $0 --hosts 192.168.1.10 --prioritize-tests-node node1"
+            echo "  $0 --hosts 192.168.1.10 --oss-rabbitmq"
             echo "  $0 --hosts 192.168.1.10 --truststore /path/to/truststore.p12 --truststore-pass mypass"
             exit 0
             ;;
@@ -112,6 +127,20 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Reconfigure service commands if using OSS RabbitMQ
+if $OSS_RABBITMQ; then
+    RMQ_SERVICE="rabbitmq-server"
+    RMQ_STOP_CMD="systemctl stop rabbitmq-server"
+    RMQ_START_CMD="systemctl start rabbitmq-server --no-block"
+    RMQ_RESTART_CMD="systemctl restart rabbitmq-server"
+    RMQ_STATUS_CMD="systemctl status rabbitmq-server"
+    RMQ_RESET_FAILED_CMD="systemctl reset-failed rabbitmq-server"
+    RMQ_KILL_CMD="systemctl kill -s SIGKILL rabbitmq-server"
+    echo "ℹ️  Using OSS RabbitMQ (rabbitmq-server service)"
+else
+    echo "ℹ️  Using Tanzu RabbitMQ (tanzu-rabbitmq-server service)"
+fi
 
 if $SKIP_CHAOS && $ONLY_CHAOS; then
     echo "Error: Cannot specify both --skip-chaos and --only-chaos"
@@ -366,6 +395,9 @@ wait_for_leader() {
 node_to_ip() {
     local node="$1"
     case "$node" in
+        *svm4103*) echo "$NODE1_HOST" ;; #CS ENV
+        *svm4104*) echo "$NODE2_HOST" ;; #CS ENV
+        *svm4105*) echo "$NODE3_HOST" ;; #CS ENV
         *pve-schwab-rmq01*) echo "$NODE1_HOST" ;;
         *pve-schwab-rmq02*) echo "$NODE2_HOST" ;;
         *pve-schwab-rmq03*) echo "$NODE3_HOST" ;;
@@ -798,15 +830,15 @@ force_restart_node() {
     ssh_sudo "$ip" "iptables -D INPUT -j DROP 2>/dev/null || true"
     ssh_sudo "$ip" "iptables -D OUTPUT -j DROP 2>/dev/null || true"
     
-    ssh_sudo "$ip" "systemctl stop tanzu-rabbitmq-server || true"
+    ssh_sudo "$ip" "$RMQ_STOP_CMD || true"
     ssh_sudo "$ip" "pkill -9 beam.smp || true"
     ssh_sudo "$ip" "pkill -9 epmd || true"
     ssh_sudo "$ip" "rm -f /var/lib/rabbitmq/mnesia/rabbit@*/cluster_nodes.config.tmp || true" # Clean temp config if stuck
-    ssh_sudo "$ip" "systemctl reset-failed tanzu-rabbitmq-server || true"
+    ssh_sudo "$ip" "$RMQ_RESET_FAILED_CMD || true"
     
     sleep 5 # Give OS time to clean up sockets
     
-    ssh_sudo "$ip" "systemctl start tanzu-rabbitmq-server --no-block" || true
+    ssh_sudo "$ip" "$RMQ_START_CMD" || true
 }
 
 # --- Test functions ---
@@ -866,7 +898,7 @@ test_quorum_leader_failover() {
     log_info "  Killing leader node (hard failure)..."
     # Use systemctl kill with SIGKILL for a clean hard stop
     # Fall back to pkill if systemctl fails (e.g., service not managed by systemd)
-    ssh_sudo "$leader_ip" "systemctl kill -s SIGKILL tanzu-rabbitmq-server 2>/dev/null || pkill -9 beam.smp" || true
+    ssh_sudo "$leader_ip" "$RMQ_KILL_CMD 2>/dev/null || pkill -9 beam.smp" || true
 
     sleep 5
 
@@ -949,7 +981,7 @@ test_message_durability() {
     if [[ "$leader_ip" == "$PRIORITY_HOST" ]]; then
         log_info "  Prioritized node ($PRIORITIZE_NODE) is the leader, forcing leader election first..."
         # Stop the leader to force election
-        ssh_sudo "$PRIORITY_HOST" "systemctl stop tanzu-rabbitmq-server" || true
+        ssh_sudo "$PRIORITY_HOST" "$RMQ_STOP_CMD" || true
         sleep 5
         
         # Wait for new leader election
@@ -970,7 +1002,7 @@ test_message_durability() {
 
     # Now stop the prioritized node (which should be a follower)
     log_info "  Stopping prioritized node ($PRIORITIZE_NODE) at $PRIORITY_HOST..."
-    ssh_sudo "$PRIORITY_HOST" "systemctl stop tanzu-rabbitmq-server" || true
+    ssh_sudo "$PRIORITY_HOST" "$RMQ_STOP_CMD" || true
     sleep 5
 
     # Verify messages still accessible
@@ -1053,7 +1085,7 @@ test_message_durability_streams() {
     local target_ip="$NODE2_HOST"
     
     log_info "  Stopping node at $target_ip..."
-    ssh_sudo "$target_ip" "systemctl stop tanzu-rabbitmq-server" || true
+    ssh_sudo "$target_ip" "$RMQ_STOP_CMD" || true
     sleep 5
 
     # Verify messages still accessible
@@ -1114,7 +1146,7 @@ test_cluster_recovery() {
 
     # Stop the prioritized node gracefully
     log_info "  Stopping prioritized node ($PRIORITIZE_NODE) at $PRIORITY_HOST..."
-    ssh_sudo "$PRIORITY_HOST" "systemctl stop tanzu-rabbitmq-server" || true
+    ssh_sudo "$PRIORITY_HOST" "$RMQ_STOP_CMD" || true
     sleep 5
 
     local during_nodes

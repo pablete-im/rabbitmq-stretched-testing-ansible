@@ -1,7 +1,7 @@
 ---
 # Install RabbitMQ Performance Testing Tools
 #
-# Installs both perf-test (AMQP) and stream-perf-test on a control node
+# Installs perf-test (AMQP), stream-perf-test, and OMQ (multi-protocol) on a control node
 # Run from: ansible-playbook playbooks/install_perftest.yml
 #
 - name: Install RabbitMQ Performance Test Tools
@@ -10,7 +10,9 @@
   vars:
     perf_test_version: "2.24.0"
     stream_perf_test_version: "1.6.0"
+    omq_version: "v0.41.0"
     install_dir: "{{ perf_install_dir | default(playbook_dir + '/../perf-tests/tools') }}"
+    install_omq_go: "{{ omq_install_go | default(true) }}"
   tasks:
     - name: Ensure Java is installed
       ansible.builtin.package:
@@ -74,14 +76,140 @@
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
           exec java -jar "$SCRIPT_DIR/stream-perf-test.jar" "$@"
 
+    # OMQ Installation - Go method (default)
+    - name: Check for Go installation
+      ansible.builtin.command: go version
+      register: go_check
+      changed_when: false
+      failed_when: false
+      when: install_omq_go | bool
+
+    - name: Install OMQ via Go
+      ansible.builtin.shell: |
+        export GOPATH="{{ install_dir }}/go"
+        export GOBIN="{{ install_dir }}"
+        go install github.com/rabbitmq/omq@main
+      environment:
+        GOPATH: "{{ install_dir }}/go"
+        GOBIN: "{{ install_dir }}"
+      when:
+        - install_omq_go | bool
+        - go_check.rc == 0
+
+    # OMQ Installation - Binary download method (fallback)
+    - name: Download OMQ binary (Linux AMD64)
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/omq/releases/download/{{ omq_version }}/omq_{{ omq_version | regex_replace('^v', '') }}_linux_amd64"
+        dest: "{{ install_dir }}/omq"
+        mode: '0755'
+        validate_certs: no
+      when:
+        - not (install_omq_go | bool) or go_check.rc != 0
+        - ansible_system == "Linux"
+        - ansible_architecture == "x86_64"
+
+    - name: Download OMQ binary (Linux ARM64)
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/omq/releases/download/{{ omq_version }}/omq_{{ omq_version | regex_replace('^v', '') }}_linux_arm64"
+        dest: "{{ install_dir }}/omq"
+        mode: '0755'
+        validate_certs: no
+      when:
+        - not (install_omq_go | bool) or go_check.rc != 0
+        - ansible_system == "Linux"
+        - ansible_architecture == "aarch64"
+
+    - name: Download OMQ binary (Darwin AMD64)
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/omq/releases/download/{{ omq_version }}/omq_{{ omq_version | regex_replace('^v', '') }}_darwin_amd64"
+        dest: "{{ install_dir }}/omq"
+        mode: '0755'
+        validate_certs: no
+      when:
+        - not (install_omq_go | bool) or go_check.rc != 0
+        - ansible_system == "Darwin"
+        - ansible_architecture == "x86_64"
+
+    - name: Download OMQ binary (Darwin ARM64)
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/omq/releases/download/{{ omq_version }}/omq_{{ omq_version | regex_replace('^v', '') }}_darwin_arm64"
+        dest: "{{ install_dir }}/omq"
+        mode: '0755'
+        validate_certs: no
+      when:
+        - not (install_omq_go | bool) or go_check.rc != 0
+        - ansible_system == "Darwin"
+        - ansible_architecture == "arm64"
+
+    - name: Download OMQ binary (Windows AMD64)
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/omq/releases/download/{{ omq_version }}/omq_{{ omq_version | regex_replace('^v', '') }}_windows_amd64.exe"
+        dest: "{{ install_dir }}/omq.exe"
+        mode: '0755'
+        validate_certs: no
+      when:
+        - not (install_omq_go | bool) or go_check.rc != 0
+        - ansible_system == "Win32NT"
+        - ansible_architecture == "x86_64"
+
+    - name: Download OMQ binary (FreeBSD AMD64)
+      ansible.builtin.get_url:
+        url: "https://github.com/rabbitmq/omq/releases/download/{{ omq_version }}/omq_{{ omq_version | regex_replace('^v', '') }}_freebsd_amd64"
+        dest: "{{ install_dir }}/omq"
+        mode: '0755'
+        validate_certs: no
+      when:
+        - not (install_omq_go | bool) or go_check.rc != 0
+        - ansible_system == "FreeBSD"
+        - ansible_architecture == "x86_64"
+
+    - name: Verify OMQ installation (Unix-like systems)
+      ansible.builtin.command: "{{ install_dir }}/omq --help"
+      register: omq_verify
+      changed_when: false
+      failed_when: false
+      when: ansible_system != "Win32NT"
+
+    - name: Verify OMQ installation (Windows)
+      ansible.builtin.command: "{{ install_dir }}/omq.exe --help"
+      register: omq_verify_windows
+      changed_when: false
+      failed_when: false
+      when: ansible_system == "Win32NT"
+
+    - name: Set OMQ verification result
+      ansible.builtin.set_fact:
+        omq_verify: "{{ omq_verify_windows if ansible_system == 'Win32NT' else omq_verify }}"
+
+    - name: Warn if OMQ installation failed
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: OMQ installation failed or not available for this platform."
+          - "You can manually install OMQ using:"
+          - "  go install github.com/rabbitmq/omq@main"
+          - "Or download from: https://github.com/rabbitmq/omq/releases"
+      when: omq_verify.rc != 0
+
+    - name: Set OMQ executable name
+      ansible.builtin.set_fact:
+        omq_executable: "{{ 'omq.exe' if ansible_system == 'Win32NT' else 'omq' }}"
+
     - name: Installation complete
       ansible.builtin.debug:
         msg:
           - "Performance test tools installed to: {{ install_dir }}"
           - ""
           - "Usage:"
-          - "  {{ install_dir }}/perf-test --help"
-          - "  {{ install_dir }}/stream-perf-test --help"
+          - "  {{ install_dir }}/perf-test --help          # AMQP 0.9.1 performance testing"
+          - "  {{ install_dir }}/stream-perf-test --help   # RabbitMQ Streams performance testing"
+          - "  {{ install_dir }}/{{ omq_executable }} --help               # Multi-protocol testing (AMQP 1.0, AMQP 0.9.1, STOMP, MQTT)"
           - ""
-          - "Quick test:"
+          - "Quick tests:"
+          - "  # AMQP 0.9.1:"
           - "  {{ install_dir }}/perf-test -x 1 -y 1 -u queue-test -a -h {{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}"
+          - ""
+          - "  # AMQP 1.0 with OMQ:"
+          - "  {{ install_dir }}/{{ omq_executable }} amqp --uri amqp://{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5672 --publishers 1 --consumers 1 --publish-to /queues/test-queue --consume-from /queues/test-queue --queues classic"
+          - ""
+          - "  # Multi-protocol (MQTT to AMQP 1.0):"
+          - "  {{ install_dir }}/{{ omq_executable }} mqtt-amqp --publisher-uri mqtt://{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:1883 --consumer-uri amqp://{{ hostvars[groups['az-cluster-1'][0]]['ansible_host'] }}:5672 --publishers 1 --consumers 1 --publish-to sensor/data --consume-from /queues/sensor-data --queues classic"

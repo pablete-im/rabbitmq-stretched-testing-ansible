@@ -3,11 +3,11 @@
 # Use this to establish baseline performance metrics
 
 name: baseline
-description: "Baseline test - 1 pub, 1 con, 1KB messages"
+description: "Baseline test - 5 pub, 5 con, 1KB messages"
 type: amqp
 
 # Test duration
-duration: 120
+duration: 30
 
 # Publisher settings
 publishers: 5

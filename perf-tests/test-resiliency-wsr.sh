@@ -56,6 +56,20 @@ PASSWORD=""
 SSH_USER="root"
 CLEANUP=true
 TEST_DURATION=120  # Total test duration in seconds
+OSS_RABBITMQ=false
+
+# RabbitMQ service name (tanzu-rabbitmq-server by default, rabbitmq-server for OSS)
+RMQ_SERVICE="tanzu-rabbitmq-server"
+
+# Systemctl commands (will be updated if --oss-rabbitmq is used)
+RMQ_STOP_CMD="systemctl stop tanzu-rabbitmq-server"
+RMQ_START_CMD="systemctl start tanzu-rabbitmq-server --no-block"
+RMQ_RESTART_CMD="systemctl restart tanzu-rabbitmq-server"
+RMQ_STATUS_CMD="systemctl status tanzu-rabbitmq-server"
+RMQ_RESET_FAILED_CMD="systemctl reset-failed tanzu-rabbitmq-server"
+RMQ_KILL_CMD="systemctl kill -s SIGKILL tanzu-rabbitmq-server"
+RMQ_MASK_CMD="systemctl mask tanzu-rabbitmq-server"
+RMQ_UNMASK_CMD="systemctl unmask tanzu-rabbitmq-server"
 
 # TLS configuration
 TRUSTSTORE=""
@@ -81,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --ssh-user)        SSH_USER="$2"; shift 2 ;;
         --duration)        TEST_DURATION="$2"; shift 2 ;;
         --no-cleanup)      CLEANUP=false; shift ;;
+        --oss-rabbitmq)    OSS_RABBITMQ=true; shift ;;
         --truststore)      TRUSTSTORE="$2"; shift 2 ;;
         --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
         --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
@@ -93,6 +108,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --ssh-user USERNAME           SSH username for node access (default: root)"
             echo "  --duration SECONDS            Total test duration (default: 120)"
             echo "  --no-cleanup                  Don't cleanup resources at the end"
+            echo "  --oss-rabbitmq                Use rabbitmq-server instead of tanzu-rabbitmq-server"
             echo "  --truststore PATH             Path to truststore for TLS connections"
             echo "  --truststore-pass PASSWORD    Truststore password"
             echo "  --truststore-type TYPE        Truststore type (default: JKS)"
@@ -106,6 +122,22 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Reconfigure service commands if using OSS RabbitMQ
+if $OSS_RABBITMQ; then
+    RMQ_SERVICE="rabbitmq-server"
+    RMQ_STOP_CMD="systemctl stop rabbitmq-server"
+    RMQ_START_CMD="systemctl start rabbitmq-server --no-block"
+    RMQ_RESTART_CMD="systemctl restart rabbitmq-server"
+    RMQ_STATUS_CMD="systemctl status rabbitmq-server"
+    RMQ_RESET_FAILED_CMD="systemctl reset-failed rabbitmq-server"
+    RMQ_KILL_CMD="systemctl kill -s SIGKILL rabbitmq-server"
+    RMQ_MASK_CMD="systemctl mask rabbitmq-server"
+    RMQ_UNMASK_CMD="systemctl unmask rabbitmq-server"
+    echo "ℹ️  Using OSS RabbitMQ (rabbitmq-server service)"
+else
+    echo "ℹ️  Using Tanzu RabbitMQ (tanzu-rabbitmq-server service)"
+fi
 
 # Get password if not provided
 if [[ -z "$PASSWORD" ]]; then
@@ -246,13 +278,13 @@ simulate_az1_failure() {
         
         # CRITICAL: Prevent systemd from restarting the service after kill
         log_info "    Masking service to prevent auto-restart..."
-        ssh_sudo "$host" "systemctl mask tanzu-rabbitmq-server" || true
+        ssh_sudo "$host" "$RMQ_MASK_CMD" || true
         
         # Kill all RabbitMQ processes abruptly (simulating server crash)
         ssh_sudo "$host" "pkill -9 beam.smp" || true
         ssh_sudo "$host" "pkill -9 epmd" || true
         ssh_sudo "$host" "pkill -9 rabbitmq-server" || true
-        ssh_sudo "$host" "systemctl kill -s SIGKILL tanzu-rabbitmq-server" || true
+        ssh_sudo "$host" "$RMQ_KILL_CMD" || true
         
         # Additional kill commands to ensure everything is dead
         ssh_sudo "$host" "killall -9 beam.smp epmd rabbitmq-server erl_child_setup inet_gethost" 2>/dev/null || true
@@ -279,9 +311,9 @@ restore_az1_nodes() {
     for host in "${AZ1_FAILED_NODES[@]}"; do
         log_info "  Restoring RabbitMQ on $host..."
         # Unmask the service first (in case it was masked during crash simulation)
-        ssh_sudo "$host" "systemctl unmask tanzu-rabbitmq-server || true"
-        ssh_sudo "$host" "systemctl reset-failed tanzu-rabbitmq-server || true"
-        ssh_sudo "$host" "systemctl start tanzu-rabbitmq-server --no-block" || true
+        ssh_sudo "$host" "$RMQ_UNMASK_CMD || true"
+        ssh_sudo "$host" "$RMQ_RESET_FAILED_CMD || true"
+        ssh_sudo "$host" "$RMQ_START_CMD" || true
     done
     
     # Wait for nodes to recover
@@ -556,7 +588,7 @@ restore_wsr_config() {
     log_info "  Step 2: Restarting az-cluster-2..."
     for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
         log_info "    Restarting $node_ip..."
-        ssh_sudo "$node_ip" "systemctl restart tanzu-rabbitmq-server" 2>/dev/null &
+        ssh_sudo "$node_ip" "$RMQ_RESTART_CMD" 2>/dev/null &
     done
     wait
     

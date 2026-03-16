@@ -47,6 +47,8 @@ TEST_PATTERNS=(
     "^latency-sweep-"
     "^wsr-stream-latency.*"
     "^test-.*"
+    "^stream-.*"
+    "^streams.*"
 )
 
 # Parse arguments
