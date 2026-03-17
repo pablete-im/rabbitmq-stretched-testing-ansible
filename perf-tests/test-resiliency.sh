@@ -1191,7 +1191,7 @@ test_cluster_recovery() {
     # Stop the prioritized node gracefully
     log_info "  Stopping prioritized node ($PRIORITIZE_NODE) at $PRIORITY_HOST..."
     ssh_sudo "$PRIORITY_HOST" "$RMQ_STOP_CMD" || true
-    sleep 5
+    sleep 10
 
     local during_nodes
     during_nodes=$(get_running_nodes)
