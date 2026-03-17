@@ -3,7 +3,7 @@
 # Quick Results Summary
 #
 # Displays a summary of perf-test results for comparison.
-# Extracts the final summary line from each result file.
+# Organized by metric (one table per metric showing all tests).
 #
 # Usage:
 #   ./perf-tests/compare-results.sh                    # All results
@@ -31,146 +31,364 @@ if [[ ! -d "$RESULTS_DIR" ]] || [[ -z "$(ls -A "$RESULTS_DIR"/*.txt 2>/dev/null)
     exit 0
 fi
 
-echo "=============================================="
-echo "  Performance Test Results"
-echo "=============================================="
-echo ""
+# Associative arrays to store metrics for all tests
+declare -A SENT_RATES
+declare -A CONFIRMED_RATES
+declare -A RECV_RATES
+declare -A CONFIRM_LATS
+declare -A CONSUMER_LATS
+declare -A TEST_DATES
+declare -A TEST_HOSTS
+declare -A TEST_SCENARIOS
 
-# Helper to convert µs to ms
-convert_us_to_ms() {
-    local val="$1"
-    # Remove any trailing units like ' µs' or ' us' or ' ms'
-    val=$(echo "$val" | sed 's/ [µu]s//g' | sed 's/ ms//g')
+# Helper to parse OMQ formatted metrics and calculate averages
+parse_formatted_metrics() {
+    local file="$1"
+    local metric="$2"  # "sent", "confirmed", "received", "published", "consumed"
     
-    if [[ -z "$val" || "$val" == "N/A" ]]; then
+    # Extract all metric values from "id: X, time Y s, sent: Z msg/s" lines
+    local values=$(grep "^id: .*, time .* s, " "$file" 2>/dev/null | \
+                   grep -o "${metric}: [0-9]* msg/s" | \
+                   awk '{print $2}')
+    
+    if [[ -z "$values" ]]; then
         echo "N/A"
         return
     fi
     
-    # Check if it looks like a slash-separated list of numbers (possibly floating point)
-    if [[ "$val" =~ ^[0-9./]+$ ]]; then
-        echo "$val" | awk -F'/' '{OFS="/"; for(i=1;i<=NF;i++) $i=sprintf("%.3f", $i/1000)} 1'
+    # Calculate average
+    local sum=0
+    local count=0
+    while IFS= read -r val; do
+        if [[ "$val" =~ ^[0-9]+$ ]]; then
+            sum=$((sum + val))
+            count=$((count + 1))
+        fi
+    done <<< "$values"
+    
+    if [[ $count -eq 0 ]]; then
+        echo "N/A"
     else
-        echo "$val"
+        echo $((sum / count))
     fi
 }
 
-# Helper to detect test type (streams vs amqp)
-detect_test_type() {
+# Helper to parse stream-perf-test formatted metrics
+parse_stream_perf_metrics() {
     local file="$1"
-    if grep -q "stream-perf-test.jar\|--streams" "$file" 2>/dev/null; then
-        echo "streams"
+    local metric="$2"  # "published", "confirmed", "consumed"
+    
+    # Extract all metric values from stream-perf-test lines like:
+    # "N, published X msg/s, confirmed Y msg/s, consumed Z msg/s, ..."
+    local values=$(grep "^[0-9]*, ${metric} [0-9]* msg/s" "$file" 2>/dev/null | \
+                   sed -n "s/.*${metric} \([0-9]*\) msg\/s.*/\1/p")
+    
+    if [[ -z "$values" ]]; then
+        # Try summary line for stream-perf-test
+        values=$(grep "^Summary: " "$file" 2>/dev/null | \
+                 sed -n "s/.*${metric} \([0-9]*\) msg\/s.*/\1/p")
+    fi
+    
+    if [[ -z "$values" ]]; then
+        echo "N/A"
+        return
+    fi
+    
+    # Calculate average
+    local sum=0
+    local count=0
+    while IFS= read -r val; do
+        if [[ "$val" =~ ^[0-9]+$ ]]; then
+            sum=$((sum + val))
+            count=$((count + 1))
+        fi
+    done <<< "$values"
+    
+    if [[ $count -eq 0 ]]; then
+        echo "N/A"
     else
-        echo "amqp"
+        echo $((sum / count))
     fi
 }
 
-# Helper to parse AMQP results
-parse_amqp_results() {
+# Helper to extract final latencies from file and parse into individual quantiles
+extract_final_latencies() {
     local file="$1"
-    local consumer_file="$2"
+    local latency_type="$2"  # "confirm" or "consumer"
     
-    local send_rate="N/A"
-    local recv_rate="N/A"
-    local confirm_lat="N/A"
-    local consumer_lat="N/A"
+    # First, check if this is a stream-perf-test file (has lines starting with numbers)
+    # Format: "N, published X msg/s, confirmed Y msg/s, consumed Z msg/s, confirm latency median/75th/95th/99th W/X/Y/Z ms, latency median/75th/95th/99th A/B/C/D ms"
+    local stream_perf_line=$(grep "^[0-9]*, published " "$file" 2>/dev/null | tail -1)
     
-    if [[ -f "$consumer_file" ]]; then
-        # Split files: get non-zero values from each file
-        local prod_send=$(grep -E "^id: .*, sending rate avg:" "$file" | sed 's/.*sending rate avg: \([0-9]*\) msg\/s.*/\1/' 2>/dev/null || echo "0")
-        local prod_confirm=$(grep -E "^id: .*, confirm latency" "$file" | sed 's/.*confirm latency min\/median\/75th\/95th\/99th\/max \(.*\)/\1/' 2>/dev/null || echo "")
+    if [[ -n "$stream_perf_line" ]]; then
+        # This is stream-perf-test format
+        if [[ "$latency_type" == "confirm" ]]; then
+            # Extract: confirm latency median/75th/95th/99th W/X/Y/Z ms
+            local pattern="confirm latency median/75th/95th/99th ([0-9./]+) ms"
+            if [[ "$stream_perf_line" =~ $pattern ]]; then
+                local lat_values="${BASH_REMATCH[1]}"
+                IFS='/' read -ra VALS <<< "$lat_values"
+                # stream-perf-test format: median/75th/95th/99th (4 values, no min/max)
+                # Output format: min|median|75th|90th|95th|99th|max
+                echo "|${VALS[0]}|${VALS[1]}||${VALS[2]}|${VALS[3]}|"
+                return
+            fi
+        else
+            # Extract: latency median/75th/95th/99th A/B/C/D ms (this is consumer latency for streams)
+            # Need to match ", latency median" to avoid matching "confirm latency"
+            local pattern=", latency median/75th/95th/99th ([0-9./]+) ms"
+            if [[ "$stream_perf_line" =~ $pattern ]]; then
+                local lat_values="${BASH_REMATCH[1]}"
+                IFS='/' read -ra VALS <<< "$lat_values"
+                # stream-perf-test format: median/75th/95th/99th (4 values, no min/max)
+                # Output format: min|median|75th|90th|95th|99th|max
+                echo "|${VALS[0]}|${VALS[1]}||${VALS[2]}|${VALS[3]}|"
+                return
+            fi
+        fi
         
-        local cons_recv=$(grep -E "^id: .*, receiving rate avg:" "$consumer_file" | sed 's/.*receiving rate avg: \([0-9]*\) msg\/s.*/\1/' 2>/dev/null || echo "0")
-        local cons_lat=$(grep -E "^id: .*, consumer latency" "$consumer_file" | sed 's/.*consumer latency min\/median\/75th\/95th\/99th\/max \(.*\)/\1/' 2>/dev/null || echo "")
-        
-        # Use non-zero values
-        [[ "$prod_send" != "0" ]] && send_rate="$prod_send"
-        [[ "$cons_recv" != "0" ]] && recv_rate="$cons_recv"
-        [[ -n "$prod_confirm" ]] && confirm_lat="$prod_confirm"
-        [[ -n "$cons_lat" ]] && consumer_lat="$cons_lat"
-        
+        # If not found in data lines, try summary line
+        local summary=$(grep "^Summary: " "$file" 2>/dev/null | tail -1)
+        if [[ -n "$summary" ]]; then
+            if [[ "$latency_type" == "confirm" ]]; then
+                # Extract: confirm latency 95th X ms
+                local pattern="confirm latency 95th ([0-9]+) ms"
+                if [[ "$summary" =~ $pattern ]]; then
+                    local val="${BASH_REMATCH[1]}"
+                    # Only 95th percentile available in summary
+                    echo "||||${val}||"
+                    return
+                fi
+            else
+                # Extract: latency 95th X ms (with comma before to avoid confirm latency)
+                local pattern=", latency 95th ([0-9]+) ms"
+                if [[ "$summary" =~ $pattern ]]; then
+                    local val="${BASH_REMATCH[1]}"
+                    # Only 95th percentile available in summary
+                    echo "||||${val}||"
+                    return
+                fi
+            fi
+        fi
+    fi
+    
+    # Not stream-perf-test format, try perf-test summary lines (with 75th)
+    # Format: "id: baseline, confirm latency min/median/75th/95th/99th/max 2004/3750/4356/5601/7072/23250 µs"
+    if [[ "$latency_type" == "confirm" ]]; then
+        local summary=$(grep "^id: .*, confirm latency min/median/75th/95th/99th/max" "$file" 2>/dev/null | tail -1)
+        if [[ -n "$summary" ]]; then
+            local lat=$(echo "$summary" | sed -n 's/.*confirm latency min\/median\/75th\/95th\/99th\/max \([0-9./]*\) \(µs\|ms\).*/\1 \2/p')
+            if [[ "$lat" =~ ([0-9./]+)\ (µs|ms) ]]; then
+                local lat_values="${BASH_REMATCH[1]}"
+                local unit="${BASH_REMATCH[2]}"
+                if [[ "$unit" == "µs" ]]; then
+                    IFS='/' read -ra VALS <<< "$lat_values"
+                    local converted=()
+                    for val in "${VALS[@]}"; do
+                        if [[ "$val" =~ ^[0-9.]+$ ]]; then
+                            converted+=("$(echo "scale=3; $val / 1000" | bc)")
+                        else
+                            converted+=("$val")
+                        fi
+                    done
+                    # Format: min|median|75th||95th|99th|max (perf-test has 75th, no 90th)
+                    echo "${converted[0]}|${converted[1]}|${converted[2]}||${converted[3]}|${converted[4]}|${converted[5]}"
+                else
+                    IFS='/' read -ra VALS <<< "$lat_values"
+                    echo "${VALS[0]}|${VALS[1]}|${VALS[2]}||${VALS[3]}|${VALS[4]}|${VALS[5]}"
+                fi
+                return
+            fi
+        fi
     else
-        # Single file: extract all metrics
-        send_rate=$(grep -E "^id: .*, sending rate avg:" "$file" | tail -1 | sed 's/.*sending rate avg: \([0-9]*\) msg\/s.*/\1/' 2>/dev/null || echo "N/A")
-        recv_rate=$(grep -E "^id: .*, receiving rate avg:" "$file" | tail -1 | sed 's/.*receiving rate avg: \([0-9]*\) msg\/s.*/\1/' 2>/dev/null || echo "N/A")
-        confirm_lat=$(grep -E "^id: .*, confirm latency min/median/75th/95th/99th/max" "$file" | tail -1 | sed 's/.*confirm latency min\/median\/75th\/95th\/99th\/max \(.*\)/\1/' 2>/dev/null || echo "N/A")
-        consumer_lat=$(grep -E "^id: .*, consumer latency min/median/75th/95th/99th/max" "$file" | tail -1 | sed 's/.*consumer latency min\/median\/75th\/95th\/99th\/max \(.*\)/\1/' 2>/dev/null || echo "N/A")
-        
-        # Fallback for inline format (consumer latency: X, confirm latency: Y)
-        if [[ "$confirm_lat" == "N/A" ]]; then
-            local line=$(grep "confirm latency: [0-9]" "$file" | tail -1 2>/dev/null || true)
-            if [[ -n "$line" ]]; then
-                confirm_lat=$(echo "$line" | sed -n 's/.*confirm latency: \([0-9\/]*\).*/\1/p')
-            fi
-        fi
-        
-        if [[ "$consumer_lat" == "N/A" ]]; then
-            local line=$(grep "consumer latency: [0-9]" "$file" | tail -1 2>/dev/null || true)
-            if [[ -n "$line" ]]; then
-                consumer_lat=$(echo "$line" | sed -n 's/.*consumer latency: \([0-9\/]*\).*/\1/p')
-            fi
-        fi
-    fi
-    
-    # Convert µs to ms if needed
-    if [[ "$confirm_lat" == *"µs"* || "$confirm_lat" == *"us"* ]]; then
-        confirm_lat=$(convert_us_to_ms "$confirm_lat")
-        confirm_lat="${confirm_lat} ms"
-    fi
-    
-    if [[ "$consumer_lat" == *"µs"* || "$consumer_lat" == *"us"* ]]; then
-        consumer_lat=$(convert_us_to_ms "$consumer_lat")
-        consumer_lat="${consumer_lat} ms"
-    fi
-    
-    echo "$send_rate|$recv_rate|$confirm_lat|$consumer_lat"
-}
-
-# Helper to parse Stream results
-parse_stream_results() {
-    local file="$1"
-    local consumer_file="$2"
-    
-    local send_rate="N/A"
-    local recv_rate="N/A"
-    local confirm_lat="N/A"
-    local consumer_lat="N/A"
-    
-    # Parse producer file
-    local summary=$(grep "^Summary:" "$file" | tail -1 2>/dev/null || true)
-    if [[ -n "$summary" ]]; then
-        send_rate=$(echo "$summary" | sed -n 's/.*published \([0-9]*\) msg\/s.*/\1/p')
-        
-        # If single file, get consumer data too
-        if [[ ! -f "$consumer_file" ]]; then
-            recv_rate=$(echo "$summary" | sed -n 's/.*consumed \([0-9]*\) msg\/s.*/\1/p')
-            local lat_val=$(echo "$summary" | sed -n 's/.*latency 95th \([0-9]*\) ms.*/\1/p')
-            if [[ -n "$lat_val" ]]; then
-                consumer_lat="${lat_val} ms (95th)"
+        local summary=$(grep "^id: .*, consumer latency min/median/75th/95th/99th/max" "$file" 2>/dev/null | tail -1)
+        if [[ -n "$summary" ]]; then
+            local lat=$(echo "$summary" | sed -n 's/.*consumer latency min\/median\/75th\/95th\/99th\/max \([0-9./]*\) \(µs\|ms\).*/\1 \2/p')
+            if [[ "$lat" =~ ([0-9./]+)\ (µs|ms) ]]; then
+                local lat_values="${BASH_REMATCH[1]}"
+                local unit="${BASH_REMATCH[2]}"
+                if [[ "$unit" == "µs" ]]; then
+                    IFS='/' read -ra VALS <<< "$lat_values"
+                    local converted=()
+                    for val in "${VALS[@]}"; do
+                        if [[ "$val" =~ ^[0-9.]+$ ]]; then
+                            converted+=("$(echo "scale=3; $val / 1000" | bc)")
+                        else
+                            converted+=("$val")
+                        fi
+                    done
+                    # Format: min|median|75th||95th|99th|max (perf-test has 75th, no 90th)
+                    echo "${converted[0]}|${converted[1]}|${converted[2]}||${converted[3]}|${converted[4]}|${converted[5]}"
+                else
+                    IFS='/' read -ra VALS <<< "$lat_values"
+                    echo "${VALS[0]}|${VALS[1]}|${VALS[2]}||${VALS[3]}|${VALS[4]}|${VALS[5]}"
+                fi
+                return
             fi
         fi
     fi
     
-    # Parse consumer file if exists
-    if [[ -f "$consumer_file" ]]; then
-        local cons_summary=$(grep "^Summary:" "$consumer_file" | tail -1 2>/dev/null || true)
-        if [[ -n "$cons_summary" ]]; then
-            local cons_recv=$(echo "$cons_summary" | sed -n 's/.*consumed \([0-9]*\) msg\/s.*/\1/p')
-            [[ "$cons_recv" != "0" ]] && recv_rate="$cons_recv"
+    # Fallback: try formatted metrics line (OMQ format)
+    local last_metric_line=$(grep "^id: .*, time .* s, " "$file" 2>/dev/null | tail -1)
+    
+    if [[ -n "$last_metric_line" ]]; then
+        # OMQ format case 1: with label "min/median/90th/95th/99th/max consumer latency: values"
+        local pattern1="min/median/90th/95th/99th/max ${latency_type} latency: ([0-9./]+) (µs|ms)"
+        # OMQ format case 2: without label "confirm latency: values" (only for confirm)
+        local pattern2="${latency_type} latency: ([0-9./]+) (µs|ms)"
+        
+        if [[ "$last_metric_line" =~ $pattern1 ]]; then
+            local lat_values="${BASH_REMATCH[1]}"
+            local unit="${BASH_REMATCH[2]}"
             
-            local lat_val=$(echo "$cons_summary" | sed -n 's/.*latency 95th \([0-9]*\) ms.*/\1/p')
-            if [[ -n "$lat_val" ]]; then
-                consumer_lat="${lat_val} ms (95th)"
+            # Convert µs to ms if needed
+            if [[ "$unit" == "µs" ]]; then
+                IFS='/' read -ra VALS <<< "$lat_values"
+                local converted=()
+                for val in "${VALS[@]}"; do
+                    if [[ "$val" =~ ^[0-9.]+$ ]]; then
+                        converted+=("$(echo "scale=3; $val / 1000" | bc)")
+                    else
+                        converted+=("$val")
+                    fi
+                done
+                # Format: min|median||90th|95th|99th|max (OMQ has 90th instead of 75th)
+                echo "${converted[0]}|${converted[1]}||${converted[2]}|${converted[3]}|${converted[4]}|${converted[5]}"
+            else
+                IFS='/' read -ra VALS <<< "$lat_values"
+                echo "${VALS[0]}|${VALS[1]}||${VALS[2]}|${VALS[3]}|${VALS[4]}|${VALS[5]}"
             fi
+            return
+        elif [[ "$last_metric_line" =~ $pattern2 ]]; then
+            # This is the case where there's no label (confirm latency in OMQ)
+            local lat_values="${BASH_REMATCH[1]}"
+            local unit="${BASH_REMATCH[2]}"
+            
+            # Convert µs to ms if needed
+            if [[ "$unit" == "µs" ]]; then
+                IFS='/' read -ra VALS <<< "$lat_values"
+                local converted=()
+                for val in "${VALS[@]}"; do
+                    if [[ "$val" =~ ^[0-9.]+$ ]]; then
+                        converted+=("$(echo "scale=3; $val / 1000" | bc)")
+                    else
+                        converted+=("$val")
+                    fi
+                done
+                # Format: min|median||90th|95th|99th|max (OMQ has 90th instead of 75th)
+                echo "${converted[0]}|${converted[1]}||${converted[2]}|${converted[3]}|${converted[4]}|${converted[5]}"
+            else
+                IFS='/' read -ra VALS <<< "$lat_values"
+                echo "${VALS[0]}|${VALS[1]}||${VALS[2]}|${VALS[3]}|${VALS[4]}|${VALS[5]}"
+            fi
+            return
         fi
     fi
     
-    echo "$send_rate|$recv_rate|$confirm_lat|$consumer_lat"
+    echo "||||||"
+}
+
+# Helper to extract average rate from summary line or calculated from metrics
+extract_rate() {
+    local file="$1"
+    local rate_type="$2"  # "sending", "confirmed", or "receiving"
+    
+    # Check if this is a stream-perf-test file first
+    if grep -q "^[0-9]*, published " "$file" 2>/dev/null; then
+        # This is stream-perf-test format - use different metric names
+        case "$rate_type" in
+            sending)
+                parse_stream_perf_metrics "$file" "published"
+                ;;
+            confirmed)
+                parse_stream_perf_metrics "$file" "confirmed"
+                ;;
+            receiving)
+                parse_stream_perf_metrics "$file" "consumed"
+                ;;
+        esac
+        return
+    fi
+    
+    # Try summary line first (from perf-test or final OMQ summary)
+    local pattern="${rate_type} rate avg: ([0-9]+) msg/s"
+    local summary_line=$(grep "${rate_type} rate avg:" "$file" 2>/dev/null | tail -1)
+    
+    if [[ -n "$summary_line" && "$summary_line" =~ $pattern ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return
+    fi
+    
+    # If not found, calculate from formatted metrics
+    if [[ "$rate_type" == "sending" ]]; then
+        parse_formatted_metrics "$file" "sent"
+    elif [[ "$rate_type" == "confirmed" ]]; then
+        parse_formatted_metrics "$file" "confirmed"
+    else
+        parse_formatted_metrics "$file" "received"
+    fi
+}
+
+# Print a metric table (for rates)
+print_rate_table() {
+    local title="$1"
+    local -n data_array=$2
+    
+    echo ""
+    echo "$title:"
+    printf "  %-40s | %-15s\n" "Test" "Average Rate"
+    printf "  %-40s | %-15s\n" "----------------------------------------" "---------------"
+    
+    # Sort by test name
+    for test in $(echo "${!data_array[@]}" | tr ' ' '\n' | sort); do
+        local value="${data_array[$test]}"
+        if [[ "$value" == "N/A" ]]; then
+            printf "  %-40s | %-15s\n" "$test" "N/A"
+        else
+            printf "  %-40s | %'15d\n" "$test" "$value"
+        fi
+    done
+}
+
+# Print a latency table with separate columns for each quantile
+print_latency_table() {
+    local title="$1"
+    local -n data_array=$2
+    
+    echo ""
+    echo "$title:"
+    printf "  %-40s | %10s | %10s | %10s | %10s | %10s | %10s | %10s\n" \
+           "Test" "min" "median" "75th" "90th" "95th" "99th" "max"
+    printf "  %-40s | %10s | %10s | %10s | %10s | %10s | %10s | %10s\n" \
+           "----------------------------------------" "----------" "----------" "----------" "----------" "----------" "----------" "----------"
+    
+    # Sort by test name
+    for test in $(echo "${!data_array[@]}" | tr ' ' '\n' | sort); do
+        local value="${data_array[$test]}"
+        
+        # Split value by pipe: min|median|75th|90th|95th|99th|max
+        IFS='|' read -ra VALS <<< "$value"
+        
+        # Format each value, use empty string if not available
+        local min="${VALS[0]:-}"
+        local median="${VALS[1]:-}"
+        local p75="${VALS[2]:-}"
+        local p90="${VALS[3]:-}"
+        local p95="${VALS[4]:-}"
+        local p99="${VALS[5]:-}"
+        local max="${VALS[6]:-}"
+        
+        printf "  %-40s | %10s | %10s | %10s | %10s | %10s | %10s | %10s\n" \
+               "$test" "$min" "$median" "$p75" "$p90" "$p95" "$p99" "$max"
+    done
 }
 
 # Collect matching files
 FILES=()
 for f in "$RESULTS_DIR"/*.txt; do
+    # Skip .consumer files (we'll process them with their main file)
+    [[ "$f" == *.consumer ]] && continue
+    
     if [[ -n "$FILTER" ]]; then
         if grep -q "# Scenario: .*${FILTER}" "$f" 2>/dev/null; then
             FILES+=("$f")
@@ -185,44 +403,75 @@ if [[ -n "$LAST" && ${#FILES[@]} -gt $LAST ]]; then
     FILES=("${FILES[@]: -$LAST}")
 fi
 
+if [[ ${#FILES[@]} -eq 0 ]]; then
+    echo "No files found matching filter"
+    exit 0
+fi
+
+echo "=============================================="
+echo "  Performance Test Comparison"
+[[ -n "$FILTER" ]] && echo "  Filter: $FILTER"
+echo "=============================================="
+
+# First pass: collect all metrics
 for f in "${FILES[@]}"; do
     FILENAME=$(basename "$f")
-    SCENARIO=$(grep "^# Scenario:" "$f" 2>/dev/null | sed 's/# Scenario: //' || true)
-    DATE=$(grep "^# Date:" "$f" 2>/dev/null | sed 's/# Date: //' || true)
-    LABEL=$(grep "^# Label:" "$f" 2>/dev/null | sed 's/# Label: //' || true)
+    SCENARIO=$(grep "^# Scenario:" "$f" 2>/dev/null | sed 's/# Scenario: //' | head -1 || echo "unknown")
+    DATE=$(grep "^# Date:" "$f" 2>/dev/null | sed 's/# Date: //' | head -1 || echo "")
+    ALIAS=$(grep "^# Alias:" "$f" 2>/dev/null | sed 's/# Alias: //' | head -1 || echo "")
     
-    HOST=$(grep "^# Host:" "$f" 2>/dev/null | sed 's/# Host: //' || true)
+    HOST=$(grep "^# Host:" "$f" 2>/dev/null | sed 's/# Host: //' | head -1 || true)
     if [[ -z "$HOST" ]]; then
-        HOST=$(grep "^# Producer Host:" "$f" 2>/dev/null | sed 's/# Producer Host: //' || true)
+        HOST=$(grep "^# Producer Host:" "$f" 2>/dev/null | sed 's/# Producer Host: //' | head -1 || true)
     fi
-
-    echo "--- $FILENAME ---"
-    echo "  Scenario: $SCENARIO"
-    echo "  Date:     $DATE"
-    echo "  Host:     $HOST"
-    [[ -n "$LABEL" ]] && echo "  Label:    $LABEL"
-
-    # Detect test type and parse accordingly
-    TEST_TYPE=$(detect_test_type "$f")
+    
+    # Use alias if available, otherwise use filename without extension as test identifier
+    if [[ -n "$ALIAS" ]]; then
+        TEST_ID="$ALIAS"
+    else
+        TEST_ID="${FILENAME%.txt}"
+    fi
+    
+    # Check if there's a consumer file
     CONSUMER_FILE="${f}.consumer"
     
-    if [[ "$TEST_TYPE" == "streams" ]]; then
-        RESULTS=$(parse_stream_results "$f" "$CONSUMER_FILE")
-    else
-        RESULTS=$(parse_amqp_results "$f" "$CONSUMER_FILE")
+    # Extract sent rate
+    SENT_RATE=$(extract_rate "$f" "sending")
+    
+    # Extract confirmed rate
+    CONFIRMED_RATE=$(extract_rate "$f" "confirmed")
+    
+    # Extract received rate (try main file first, then consumer file)
+    RECV_RATE=$(extract_rate "$f" "receiving")
+    if [[ "$RECV_RATE" == "N/A" && -f "$CONSUMER_FILE" ]]; then
+        RECV_RATE=$(extract_rate "$CONSUMER_FILE" "receiving")
     fi
     
-    IFS='|' read -r SEND_RATE RECV_RATE CONFIRM_LAT CONSUMER_LAT <<< "$RESULTS"
-
-    # Display Tables
-    printf "\n  %-20s | %-15s | %-15s\n" "Metric" "Send Rate" "Recv Rate"
-    printf "  %-20s | %-15s | %-15s\n" "--------------------" "---------------" "---------------"
-    printf "  %-20s | %-15s | %-15s\n" "Throughput (msg/s)" "$SEND_RATE" "$RECV_RATE"
-
-    printf "\n  %-20s | %-60s\n" "Metric" "Latency (min/med/75/95/99/max)"
-    printf "  %-20s | %-60s\n" "--------------------" "------------------------------------------------------------"
-    printf "  %-20s | %-60s\n" "Confirm Latency" "$CONFIRM_LAT"
-    printf "  %-20s | %-60s\n" "Consumer Latency" "$CONSUMER_LAT"
-
-    echo ""
+    # Extract confirm latency
+    CONFIRM_LAT=$(extract_final_latencies "$f" "confirm")
+    
+    # Extract consumer latency (try main file first, then consumer file)
+    CONSUMER_LAT=$(extract_final_latencies "$f" "consumer")
+    if [[ "$CONSUMER_LAT" == "||||||" && -f "$CONSUMER_FILE" ]]; then
+        CONSUMER_LAT=$(extract_final_latencies "$CONSUMER_FILE" "consumer")
+    fi
+    
+    # Store in associative arrays
+    SENT_RATES["$TEST_ID"]="$SENT_RATE"
+    CONFIRMED_RATES["$TEST_ID"]="$CONFIRMED_RATE"
+    RECV_RATES["$TEST_ID"]="$RECV_RATE"
+    CONFIRM_LATS["$TEST_ID"]="$CONFIRM_LAT"
+    CONSUMER_LATS["$TEST_ID"]="$CONSUMER_LAT"
+    TEST_DATES["$TEST_ID"]="$DATE"
+    TEST_HOSTS["$TEST_ID"]="$HOST"
+    TEST_SCENARIOS["$TEST_ID"]="$SCENARIO"
 done
+
+# Second pass: print tables organized by metric
+print_rate_table "Sent Rate (msg/s)" SENT_RATES
+print_rate_table "Confirmed Rate (msg/s)" CONFIRMED_RATES
+print_rate_table "Received Rate (msg/s)" RECV_RATES
+print_latency_table "Confirm Latency (ms)" CONFIRM_LATS
+print_latency_table "Consumer Latency (ms)" CONSUMER_LATS
+
+echo ""

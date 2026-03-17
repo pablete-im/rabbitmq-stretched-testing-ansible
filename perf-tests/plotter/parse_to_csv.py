@@ -58,6 +58,20 @@ class PerfTestCSVParser:
         
         return "unknown"
     
+    def extract_alias(self, filepath):
+        """Extract alias from the header if available"""
+        try:
+            with open(filepath, 'r') as f:
+                for line in f:
+                    if line.startswith("# Alias:"):
+                        return line.split(":", 1)[1].strip()
+                    # Stop after checking header section
+                    if line.strip() and not line.startswith("#"):
+                        break
+        except Exception as e:
+            pass
+        return None
+    
     def parse_data_line(self, line):
         """Parse a data line that starts with 'id: ..., time ...'"""
         # Pattern to match the data lines
@@ -70,6 +84,10 @@ class PerfTestCSVParser:
         test_id = match.group(1)
         time_seconds = float(match.group(2))
         data_part = match.group(3)
+        
+        # Skip time 0 entries
+        if round(time_seconds) == 0:
+            return None
         
         result = {
             'time': round(time_seconds),  # Round to nearest integer second
@@ -220,6 +238,7 @@ class PerfTestCSVParser:
             # Parse all files in this group and merge their data
             merged_data_points = defaultdict(dict)  # time -> metric -> value
             scenario = None
+            alias = None
             
             for filepath in file_list:
                 file_scenario, data_points = self.parse_file(filepath)
@@ -228,6 +247,10 @@ class PerfTestCSVParser:
                     
                 if scenario is None:
                     scenario = file_scenario
+                
+                # Extract alias from first file (should be same for all files in group)
+                if alias is None:
+                    alias = self.extract_alias(filepath)
                 
                 # Merge data points by time
                 for point in data_points:
@@ -248,10 +271,13 @@ class PerfTestCSVParser:
                             point[metric] = None
                     final_data_points.append(point)
                 
-                # Create series name
-                timestamp_part = base_key.split('-')[0:2]  # Get YYYYMMDD-HHMMSS part
-                timestamp = '-'.join(timestamp_part)
-                series_name = f"{scenario} ({timestamp})"
+                # Create series name - use alias if available, otherwise use timestamp
+                if alias:
+                    series_name = alias
+                else:
+                    timestamp_part = base_key.split('-')[0:2]  # Get YYYYMMDD-HHMMSS part
+                    timestamp = '-'.join(timestamp_part)
+                    series_name = f"{scenario} ({timestamp})"
                 
                 # Store merged data points for this series
                 all_data['sent'][series_name] = final_data_points

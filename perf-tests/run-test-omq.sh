@@ -39,6 +39,7 @@ CON_HOSTS=""
 USER="admin"
 PASSWORD=""
 LABEL=""
+RESULT_ALIAS=""
 EXTRA_ARGS=""
 CA_CERT=""
 TLS_SKIP_VERIFY=false
@@ -179,6 +180,9 @@ while [[ $# -gt 0 ]]; do
         --label)           
             [[ -z "${2:-}" ]] && { echo "Error: --label requires a value"; exit 1; }
             LABEL="$2"; shift 2 ;;
+        --result-alias)
+            [[ -z "${2:-}" ]] && { echo "Error: --result-alias requires a value"; exit 1; }
+            RESULT_ALIAS="$2"; shift 2 ;;
         --ca-cert)         
             [[ -z "${2:-}" ]] && { echo "Error: --ca-cert requires a value"; exit 1; }
             CA_CERT="$2"; shift 2 ;;
@@ -404,6 +408,34 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 RESULT_LABEL="${TEST_NAME}"
 [[ -n "$LABEL" ]] && RESULT_LABEL="${TEST_NAME}-${LABEL}"
 RESULT_FILE="$RESULTS_DIR/${TIMESTAMP}-${RESULT_LABEL}.txt"
+
+# --- Cleanup function for temporary files ---
+CLEANUP_DONE=false
+cleanup_temp_files() {
+    if [[ "$CLEANUP_DONE" == "true" ]]; then
+        return
+    fi
+    CLEANUP_DONE=true
+    
+    # Clean up temporary files if they exist
+    if [[ -n "${RESULT_FILE:-}" ]]; then
+        rm -f "$RESULT_FILE.omq" 2>/dev/null || true
+        rm -f "$RESULT_FILE.metrics" 2>/dev/null || true
+        rm -f "$RESULT_FILE.producer.omq" 2>/dev/null || true
+        rm -f "$RESULT_FILE.producer.metrics" 2>/dev/null || true
+        rm -f "${RESULT_FILE}.consumer.omq" 2>/dev/null || true
+        rm -f "$RESULT_FILE.consumer.metrics" 2>/dev/null || true
+        rm -f "$RESULT_FILE.consumer.metrics.display" 2>/dev/null || true
+    fi
+    
+    # Clean up combined CA file
+    if [[ -n "${COMBINED_CA_FILE:-}" && -f "$COMBINED_CA_FILE" ]]; then
+        rm -f "$COMBINED_CA_FILE" 2>/dev/null || true
+    fi
+}
+
+# Set up trap to clean up on exit
+trap cleanup_temp_files EXIT INT TERM
 
 # --- Prepare TLS configuration ---
 if [[ -n "$CA_CERT" ]]; then
@@ -729,6 +761,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     # Write headers to result files
     {
         echo "# Scenario: $SCENARIO (Producer)"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -740,6 +773,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     
     {
         echo "# Scenario: $SCENARIO (Consumer)"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -752,6 +786,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     # Write headers to result files
     {
         echo "# Scenario: $SCENARIO (Producer)"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -764,6 +799,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     
     {
         echo "# Scenario: $SCENARIO (Consumer)"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -894,6 +930,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     # Create final merged output for producer
     {
         echo "# Scenario: $SCENARIO (Producer)"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -918,6 +955,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     # Create final merged output for consumer
     {
         echo "# Scenario: $SCENARIO (Consumer)"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -939,8 +977,7 @@ if [[ -n "$CON_HOSTS" ]]; then
         cat "${RESULT_FILE}.consumer.omq"
     } > "${RESULT_FILE}.consumer"
     
-    # Cleanup temporary files
-    rm -f "$RESULT_FILE.producer.omq" "${RESULT_FILE}.consumer.omq" "$RESULT_FILE.producer.metrics" "$RESULT_FILE.consumer.metrics" "$RESULT_FILE.consumer.metrics.display"
+    # Note: Temporary files cleaned up automatically by trap on exit
     
     echo "📁 Federation test results:"
     echo "  Producer: $RESULT_FILE"
@@ -965,6 +1002,7 @@ else
     # Write header to results
     {
         echo "# Scenario: $SCENARIO"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Host: ${PUB_HOSTS:-$HOSTS}"
         [[ -n "$LABEL" ]] && echo "# Label: $LABEL"
@@ -1002,6 +1040,7 @@ else
         # Create final merged output
         {
             echo "# Scenario: $SCENARIO"
+            [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
             echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "# Host: ${PUB_HOSTS:-$HOSTS}"
             [[ -n "$LABEL" ]] && echo "# Label: $LABEL"
@@ -1022,8 +1061,7 @@ else
             cat "$RESULT_FILE.omq"
         } > "$RESULT_FILE"
         
-        # Cleanup temporary files
-        rm -f "$RESULT_FILE.omq" "$RESULT_FILE.metrics"
+        # Note: Temporary files cleaned up automatically by trap on exit
         
         exit $OMQ_EXIT_CODE
     else
@@ -1036,6 +1074,7 @@ else
         # Move OMQ output to final result file
         {
             echo "# Scenario: $SCENARIO"
+            [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
             echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "# Host: ${PUB_HOSTS:-$HOSTS}"
             [[ -n "$LABEL" ]] && echo "# Label: $LABEL"
@@ -1047,7 +1086,7 @@ else
             cat "$RESULT_FILE.omq"
         } > "$RESULT_FILE"
         
-        #rm -f "$RESULT_FILE.omq"
+        # Note: Temporary files cleaned up automatically by trap on exit
         exit $OMQ_EXIT_CODE
     fi
     
@@ -1055,7 +1094,4 @@ else
     echo "Results saved to: $RESULT_FILE"
 fi
 
-# --- Cleanup temporary files ---
-if [[ -n "${COMBINED_CA_FILE:-}" && -f "$COMBINED_CA_FILE" ]]; then
-    rm -f "$COMBINED_CA_FILE"
-fi
+# Note: Cleanup of temporary files handled automatically by trap on exit

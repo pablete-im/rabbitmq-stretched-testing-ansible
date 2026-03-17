@@ -37,6 +37,7 @@ CON_HOSTS=""
 USER="admin"
 PASSWORD=""
 LABEL=""
+RESULT_ALIAS=""
 EXTRA_ARGS=""
 TRUSTSTORE=""
 TRUSTSTORE_PASS=""
@@ -54,6 +55,7 @@ while [[ $# -gt 0 ]]; do
         --user)            USER="$2"; shift 2 ;;
         --password)        PASSWORD="$2"; shift 2 ;;
         --label)           LABEL="$2"; shift 2 ;;
+        --result-alias)    RESULT_ALIAS="$2"; shift 2 ;;
         --truststore)      TRUSTSTORE="$2"; shift 2 ;;
         --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
         --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
@@ -80,6 +82,7 @@ if [[ -z "$SCENARIO" ]]; then
     echo "  --user <user>            RabbitMQ user (default: admin)"
     echo "  --password <pass>        RabbitMQ password (or set RMQ_PASSWORD env var)"
     echo "  --label <label>          Label to add to result filename"
+    echo "  --result-alias <alias>   Alias to identify this test run in results"
     echo ""
     echo "TLS Options:"
     echo "  --truststore <path>      Path to Java truststore for TLS connections"
@@ -209,6 +212,7 @@ if [[ "$TEST_TYPE" == "stream" ]]; then
     CMD+=(-jar "$TOOLS_DIR/stream-perf-test.jar")
     CMD+=(--uris "$STREAM_URIS")
     CMD+=(--delete-streams)
+    CMD+=(--confirm-latency)
     [[ -n "$PUBLISHERS" ]] && CMD+=(--producers "$PUBLISHERS")
     [[ -n "$CONSUMERS" ]] && CMD+=(--consumers "$CONSUMERS")
     [[ -n "$MESSAGE_SIZE" ]] && CMD+=(--size "$MESSAGE_SIZE")
@@ -295,6 +299,7 @@ if [[ -n "$CON_HOSTS" ]]; then
         PRODUCER_CMD+=(--producers "${PUBLISHERS:-1}")
         PRODUCER_CMD+=(--consumers 0)
         PRODUCER_CMD+=(--delete-streams)
+        PRODUCER_CMD+=(--confirm-latency)
         [[ -n "$DURATION" ]] && PRODUCER_CMD+=(--time "$DURATION")
         [[ -n "$MESSAGE_SIZE" ]] && PRODUCER_CMD+=(--size "$MESSAGE_SIZE")
         [[ -n "$PUB_RATE" && "$PUB_RATE" != "0" ]] && PRODUCER_CMD+=(--rate "$PUB_RATE")
@@ -384,6 +389,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     {
         echo "# Federation Test - Producer Results"
         echo "# Scenario: $SCENARIO"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -397,6 +403,7 @@ if [[ -n "$CON_HOSTS" ]]; then
     {
         echo "# Federation Test - Consumer Results"
         echo "# Scenario: $SCENARIO"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Producer Host: ${PUB_HOSTS:-$HOSTS}"
         echo "# Consumer Host: $CON_HOSTS"
@@ -435,6 +442,7 @@ else
     # Write header to results
     {
         echo "# Scenario: $SCENARIO"
+        [[ -n "$RESULT_ALIAS" ]] && echo "# Alias: $RESULT_ALIAS"
         echo "# Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "# Host: ${PUB_HOSTS:-$HOSTS}"
         [[ -n "$LABEL" ]] && echo "# Label: $LABEL"
