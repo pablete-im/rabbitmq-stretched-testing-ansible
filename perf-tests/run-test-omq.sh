@@ -270,6 +270,49 @@ build_omq_uri_params() {
     echo "${uri_params[@]}"
 }
 
+# Helper function to delete queue/stream before test
+delete_queue_if_exists() {
+    local queue_name="$1"
+    local hosts="$2"
+    local user="$3"
+    local password="$4"
+    local use_tls="${5:-false}"
+    
+    # Always use HTTP port 15672 for management API
+    # (HTTPS management port 15671 may not be configured)
+    local mgmt_port="15672"
+    local mgmt_protocol="http"
+    
+    echo "🧹 Deleting queue/stream '$queue_name' if exists..."
+    
+    # Try to delete on all hosts (one will succeed if it exists)
+    local deleted=false
+    IFS=',' read -ra HOST_ARRAY <<< "$hosts"
+    for host in "${HOST_ARRAY[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        
+        # Try to delete the queue (will fail silently if it doesn't exist)
+        local url="${mgmt_protocol}://${host}:${mgmt_port}/api/queues/%2F/${queue_name}"
+        
+        local response_code=$(curl -u "${user}:${password}" -X DELETE "$url" -s -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+        
+        if [[ "$response_code" == "204" || "$response_code" == "404" ]]; then
+            if [[ "$response_code" == "204" ]]; then
+                echo "   ✓ Queue/stream deleted on $host"
+                deleted=true
+            fi
+        else
+            echo "   ⚠ Failed to delete on $host (HTTP $response_code)"
+        fi
+    done
+    
+    if [[ "$deleted" == "false" ]]; then
+        echo "   Queue/stream did not exist or could not be deleted"
+    fi
+    
+    echo "   Queue/stream cleanup completed"
+}
+
 # Function to show warnings and info for OMQ parameters
 show_amqp10_warnings() {
     local warnings=()
@@ -615,6 +658,15 @@ if [[ -n "$CON_HOSTS" ]]; then
     
     # Generate unique test ID for synchronization
     SYNC_ID="${TEST_NAME}-$(date +%s)"
+    
+    # Note: Federation tests in OMQ don't use --predeclared like perf-test does,
+    # so we should delete the queue before starting
+    USE_TLS="false"
+    [[ -n "$CA_CERT" ]] && USE_TLS="true"
+    
+    QUEUE_TO_DELETE="${QUEUE_NAME:-$TEST_NAME}"
+    delete_queue_if_exists "$QUEUE_TO_DELETE" "${PUB_HOSTS:-$HOSTS}" "$USER" "$PASSWORD" "$USE_TLS"
+    echo ""
     
     # Build producer command (no consumers)
     PRODUCER_CMD=("$TOOLS_DIR/omq" "$PROTOCOL")
@@ -996,6 +1048,15 @@ if [[ -n "$CON_HOSTS" ]]; then
     
 else
     # --- Standard single-host test ---
+    
+    # Delete queue/stream before test
+    USE_TLS="false"
+    [[ -n "$CA_CERT" ]] && USE_TLS="true"
+    
+    QUEUE_TO_DELETE="${QUEUE_NAME:-$TEST_NAME}"
+    delete_queue_if_exists "$QUEUE_TO_DELETE" "${PUB_HOSTS:-$HOSTS}" "$USER" "$PASSWORD" "$USE_TLS"
+    echo ""
+    
     echo "Command: ${CMD[*]}"
     echo ""
     

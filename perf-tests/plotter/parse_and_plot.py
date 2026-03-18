@@ -24,17 +24,45 @@ class PerfTestParser:
         os.makedirs(self.plots_dir, exist_ok=True)
         
     def get_files_by_filter(self, filter_name, max_files=None):
-        """Get files matching the filter pattern, sorted by modification time (newest first)"""
-        pattern = f"*-{filter_name}.txt*"
-        files = glob.glob(os.path.join(self.results_dir, pattern))
+        """Get files matching the filter, sorted by modification time (newest first)
+        
+        Filters by reading '# Scenario:' header from files, matching those that contain
+        the filter_name in the scenario name (case-insensitive).
+        """
+        # Get all .txt files (excluding .consumer files)
+        all_files = glob.glob(os.path.join(self.results_dir, "*.txt"))
+        all_files = [f for f in all_files if not f.endswith('.consumer')]
+        
+        matching_files = []
+        
+        if filter_name:
+            # Filter by scenario header content
+            for filepath in all_files:
+                try:
+                    with open(filepath, 'r') as f:
+                        # Read first few lines to find scenario
+                        for line in f:
+                            if line.startswith("# Scenario:"):
+                                scenario = line.split(":", 1)[1].strip()
+                                if filter_name.lower() in scenario.lower():
+                                    matching_files.append(filepath)
+                                break
+                            # Stop after header section
+                            if line.strip() and not line.startswith("#"):
+                                break
+                except Exception as e:
+                    print(f"Warning: Could not read {filepath}: {e}")
+        else:
+            # No filter, use all files
+            matching_files = all_files
         
         # Sort by modification time (newest first)
-        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        matching_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
         
         if max_files:
-            files = files[:max_files]
+            matching_files = matching_files[:max_files]
             
-        return files
+        return matching_files
     
     def extract_scenario_name(self, filepath):
         """Extract scenario name from the first line that starts with '# Scenario:'"""
@@ -75,8 +103,44 @@ class PerfTestParser:
         return None
     
     def parse_data_line(self, line):
-        """Parse a data line that starts with 'id: ..., time ...'"""
-        # Pattern to match the data lines
+        """Parse a data line that starts with 'id: ..., time ...' or stream-perf-test format"""
+        
+        # Try stream-perf-test format first: "N, published X msg/s, confirmed Y msg/s, ..."
+        stream_pattern = r'^(\d+),\s+published\s+([\d]+)\s+msg/s,\s+confirmed\s+([\d]+)\s+msg/s,\s+consumed\s+([\d]+)\s+msg/s'
+        stream_match = re.match(stream_pattern, line.strip())
+        
+        if stream_match:
+            # This is stream-perf-test format
+            time_seconds = int(stream_match.group(1))
+            
+            # Skip time 0 entries
+            if time_seconds == 0:
+                return None
+            
+            result = {
+                'time': time_seconds,
+                'sent': int(stream_match.group(2)),  # published
+                'confirmed': int(stream_match.group(3)),
+                'received': int(stream_match.group(4)),  # consumed
+                'consumer_latency_median': None,
+                'confirm_latency_median': None
+            }
+            
+            # Parse confirm latency: "confirm latency median/75th/95th/99th W/X/Y/Z ms"
+            confirm_lat_pattern = r'confirm latency median/75th/95th/99th ([\d]+)/([\d]+)/([\d]+)/([\d]+) ms'
+            confirm_match = re.search(confirm_lat_pattern, line)
+            if confirm_match:
+                result['confirm_latency_median'] = float(confirm_match.group(1))
+            
+            # Parse consumer latency: ", latency median/75th/95th/99th A/B/C/D ms"
+            consumer_lat_pattern = r', latency median/75th/95th/99th ([\d]+)/([\d]+)/([\d]+)/([\d]+) ms'
+            consumer_match = re.search(consumer_lat_pattern, line)
+            if consumer_match:
+                result['consumer_latency_median'] = float(consumer_match.group(1))
+            
+            return result
+        
+        # Try standard perf-test/OMQ format: "id: X, time Y s, ..."
         pattern = r'id: ([^,]+), time ([\d.]+) s, (.+)'
         match = re.match(pattern, line.strip())
         
@@ -157,7 +221,9 @@ class PerfTestParser:
         try:
             with open(filepath, 'r') as f:
                 for line in f:
-                    if line.startswith('id:') and ', time ' in line:
+                    # Check for standard perf-test/OMQ format: "id: X, time Y s, ..."
+                    # or stream-perf-test format: "N, published X msg/s, ..."
+                    if (line.startswith('id:') and ', time ' in line) or re.match(r'^\d+,\s+published', line):
                         parsed_data = self.parse_data_line(line)
                         if parsed_data:
                             data_points.append(parsed_data)

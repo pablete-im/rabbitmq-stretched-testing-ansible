@@ -7,7 +7,7 @@ description: "Baseline test - 5 pub, 5 con, 1KB messages"
 type: amqp
 
 # Test duration
-duration: 30
+duration: 120
 
 # Publisher settings
 publishers: 5

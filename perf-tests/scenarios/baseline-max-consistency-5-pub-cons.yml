@@ -3,26 +3,26 @@
 # Use this to establish baseline performance metrics
 
 name: baseline
-description: "Baseline test - 1 pub, 1 con, 1KB messages"
+description: "Baseline test - 5 pub, 5 con, 1KB messages"
 type: amqp
 
 # Test duration
 duration: 120
 
 # Publisher settings
-publishers: 10
+publishers: 5
 pub_rate: 0  # 0 = unlimited
 
 # Consumer settings
-consumers: 10
+consumers: 5
 consumer_rate: 0  # 0 = unlimited
 
 # Message settings
 message_size: 1000  # 1KB
-confirm: 100        # Publisher confirmation frequency (integer)
-multi_ack_every: 100  # Consumer acknowledgment frequency (mutually exclusive with autoack)
+confirm: 1        # Publisher confirmation frequency (integer)
+# multi_ack_every: 100  # Consumer acknowledgment frequency (mutually exclusive with autoack)
 # autoack: true     # Auto-acknowledge messages (true/false, mutually exclusive with multi_ack_every)
-qos: 200             # Consumer prefetch count
+qos: 1             # Consumer prefetch count
 
 # Queue settings
 queue_type: quorum  # classic, quorum, or stream

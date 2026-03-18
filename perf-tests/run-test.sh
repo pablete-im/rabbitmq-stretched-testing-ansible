@@ -141,6 +141,49 @@ build_uris() {
     done
     echo "$uris"
 }
+
+# Helper function to delete queue/stream before test
+delete_queue_if_exists() {
+    local queue_name="$1"
+    local hosts="$2"
+    local user="$3"
+    local password="$4"
+    local use_tls="${5:-false}"
+    
+    # Always use HTTP port 15672 for management API
+    # (HTTPS management port 15671 may not be configured)
+    local mgmt_port="15672"
+    local mgmt_protocol="http"
+    
+    echo "🧹 Deleting queue/stream '$queue_name' if exists..."
+    
+    # Try to delete on all hosts (one will succeed if it exists)
+    local deleted=false
+    IFS=',' read -ra HOST_ARRAY <<< "$hosts"
+    for host in "${HOST_ARRAY[@]}"; do
+        host=$(echo "$host" | xargs)  # trim whitespace
+        
+        # Try to delete the queue (will fail silently if it doesn't exist)
+        local url="${mgmt_protocol}://${host}:${mgmt_port}/api/queues/%2F/${queue_name}"
+        
+        local response_code=$(curl -u "${user}:${password}" -X DELETE "$url" -s -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+        
+        if [[ "$response_code" == "204" || "$response_code" == "404" ]]; then
+            if [[ "$response_code" == "204" ]]; then
+                echo "   ✓ Queue/stream deleted on $host"
+                deleted=true
+            fi
+        else
+            echo "   ⚠ Failed to delete on $host (HTTP $response_code)"
+        fi
+    done
+    
+    if [[ "$deleted" == "false" ]]; then
+        echo "   Queue/stream did not exist or could not be deleted"
+    fi
+    
+    echo "   Queue/stream cleanup completed"
+}
 # --- Parse scenario YAML (lightweight, no external deps) ---
 parse_yaml_value() {
     grep "^${1}:" "$SCENARIO_FILE" | head -1 | sed "s/^${1}: *//; s/#.*//; s/\"//g; s/ *$//" || true
@@ -249,6 +292,8 @@ else
             ;;
         stream)
             CMD+=(--stream-queue)
+            # Add stream-consumer-offset for stream queues if specified
+            [[ -n "$OFFSET" ]] && CMD+=(--stream-consumer-offset "$OFFSET")
             ;;
         classic)
             # classic is the default, no extra flag needed
@@ -286,6 +331,10 @@ if [[ -n "$CON_HOSTS" ]]; then
     
     # Generate unique test ID for synchronization
     SYNC_ID="${TEST_NAME}-$(date +%s)"
+    
+    # Delete queue before test (federation tests use --predeclared, so we skip deletion)
+    echo "⚠️  Federation test uses --predeclared, skipping queue deletion"
+    echo ""
     
     # Build producer command (no consumers)
     PRODUCER_CMD=("java")
@@ -436,6 +485,20 @@ if [[ -n "$CON_HOSTS" ]]; then
     
 else
     # --- Standard single-host test ---
+    
+    # Delete queue/stream before test
+    USE_TLS="false"
+    [[ -n "$TRUSTSTORE" ]] && USE_TLS="true"
+    
+    if [[ "$TEST_TYPE" == "stream" ]]; then
+        QUEUE_TO_DELETE="${STREAM_NAME:-$TEST_NAME}"
+    else
+        QUEUE_TO_DELETE="${QUEUE_NAME:-$TEST_NAME}"
+    fi
+    
+    delete_queue_if_exists "$QUEUE_TO_DELETE" "$HOSTS" "$USER" "$PASSWORD" "$USE_TLS"
+    echo ""
+    
     echo "Command: ${CMD[*]}"
     echo ""
     

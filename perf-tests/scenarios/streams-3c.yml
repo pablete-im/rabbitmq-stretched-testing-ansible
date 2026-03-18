@@ -14,7 +14,7 @@ publishers: 1
 pub_rate: 0  # Target 50k msg/s
 
 # Consumer settings
-consumers: 1  # Multiple consumers to test fan-out
+consumers: 3  # Multiple consumers to test fan-out
 
 # Message settings
 message_size: 1000  # 1KB
