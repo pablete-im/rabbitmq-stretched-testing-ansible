@@ -152,7 +152,12 @@ strip_ansi() {
 ssh_sudo() {
     local host="$1"
     local cmd="$2"
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${SSH_USER}@${host}" "sudo $cmd" 2>/dev/null
+    # If SSH_USER is root, don't use sudo (RHEL 9.7 doesn't allow "sudo" when already root)
+    if [[ "$SSH_USER" == "root" ]]; then
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${SSH_USER}@${host}" "$cmd" 2>/dev/null
+    else
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${SSH_USER}@${host}" "sudo $cmd" 2>/dev/null
+    fi
 }
 
 # Execute command on remote node via SSH (no sudo)
