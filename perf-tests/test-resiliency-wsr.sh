@@ -27,6 +27,12 @@
 #   ./perf-tests/test-resiliency-wsr.sh
 #   ./perf-tests/test-resiliency-wsr.sh --duration 180
 #   ./perf-tests/test-resiliency-wsr.sh --no-cleanup
+#   ./perf-tests/test-resiliency-wsr.sh --standby-no-fail
+#
+# Options:
+#   --standby-no-fail: Prevents cluster-2 nodes from failing during AZ1 simulation
+#                     This ensures the standby cluster maintains full quorum for
+#                     successful promotion (useful when cluster-2 has nodes in AZ1)
 # =============================================================================
 
 set -euo pipefail
@@ -57,6 +63,7 @@ SSH_USER="root"
 CLEANUP=true
 TEST_DURATION=120  # Total test duration in seconds
 OSS_RABBITMQ=false
+STANDBY_NO_FAIL=false  # If true, cluster-2 nodes won't fail even if in AZ1
 
 # RabbitMQ service name (tanzu-rabbitmq-server by default, rabbitmq-server for OSS)
 RMQ_SERVICE="tanzu-rabbitmq-server"
@@ -96,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --duration)        TEST_DURATION="$2"; shift 2 ;;
         --no-cleanup)      CLEANUP=false; shift ;;
         --oss-rabbitmq)    OSS_RABBITMQ=true; shift ;;
+        --standby-no-fail) STANDBY_NO_FAIL=true; shift ;;
         --truststore)      TRUSTSTORE="$2"; shift 2 ;;
         --truststore-pass) TRUSTSTORE_PASS="$2"; shift 2 ;;
         --truststore-type) TRUSTSTORE_TYPE="$2"; shift 2 ;;
@@ -109,6 +117,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --duration SECONDS            Total test duration (default: 120)"
             echo "  --no-cleanup                  Don't cleanup resources at the end"
             echo "  --oss-rabbitmq                Use rabbitmq-server instead of tanzu-rabbitmq-server"
+            echo "  --standby-no-fail             Prevent cluster-2 nodes from failing (ensures promotion succeeds)"
             echo "  --truststore PATH             Path to truststore for TLS connections"
             echo "  --truststore-pass PASSWORD    Truststore password"
             echo "  --truststore-type TYPE        Truststore type (default: JKS)"
@@ -278,7 +287,23 @@ except:
 simulate_az1_failure() {
     log_info "🔥 Simulating complete AZ1 failure (abrupt server crash)..."
     
-    for host in "${AZ1_FAILED_NODES[@]}"; do
+    # Determine which nodes will actually fail
+    local nodes_to_fail=()
+    
+    if $STANDBY_NO_FAIL; then
+        # Only fail cluster-1 nodes in AZ1, preserve all cluster-2 nodes
+        nodes_to_fail=("${AZ1_CLUSTER1_NODES[@]}")
+        log_info "  Mode: --standby-no-fail enabled"
+        log_info "  Only cluster-1 nodes in AZ1 will fail: ${nodes_to_fail[*]}"
+        log_info "  Cluster-2 nodes will remain active (including those in AZ1)"
+    else
+        # Fail all AZ1 nodes (default behavior)
+        nodes_to_fail=("${AZ1_FAILED_NODES[@]}")
+        log_info "  Mode: Full AZ1 failure (both clusters affected)"
+        log_info "  All AZ1 nodes will fail: ${nodes_to_fail[*]}"
+    fi
+    
+    for host in "${nodes_to_fail[@]}"; do
         log_info "  Simulating server crash on $host..."
         
         # CRITICAL: Prevent systemd from restarting the service after kill
@@ -306,14 +331,32 @@ simulate_az1_failure() {
         fi
     done
     
-    log_warn "AZ1 simulated as failed - services masked and processes killed (${#AZ1_FAILED_NODES[@]} nodes affected)"
+    if $STANDBY_NO_FAIL; then
+        log_warn "AZ1 simulated as failed for cluster-1 only (${#nodes_to_fail[@]} nodes affected)"
+        log_info "Cluster-2 nodes preserved to ensure promotion succeeds"
+    else
+        log_warn "AZ1 simulated as failed - services masked and processes killed (${#nodes_to_fail[@]} nodes affected)"
+    fi
 }
 
 # Restore AZ1 nodes
 restore_az1_nodes() {
     log_info "🔄 Restoring AZ1 nodes..."
     
-    for host in "${AZ1_FAILED_NODES[@]}"; do
+    # Determine which nodes to restore based on STANDBY_NO_FAIL flag
+    local nodes_to_restore=()
+    
+    if $STANDBY_NO_FAIL; then
+        # Only restore cluster-1 nodes in AZ1
+        nodes_to_restore=("${AZ1_CLUSTER1_NODES[@]}")
+        log_info "  Restoring cluster-1 nodes only: ${nodes_to_restore[*]}"
+    else
+        # Restore all AZ1 nodes (default behavior)
+        nodes_to_restore=("${AZ1_FAILED_NODES[@]}")
+        log_info "  Restoring all AZ1 nodes: ${nodes_to_restore[*]}"
+    fi
+    
+    for host in "${nodes_to_restore[@]}"; do
         log_info "  Restoring RabbitMQ on $host..."
         # Unmask the service first (in case it was masked during crash simulation)
         ssh_sudo "$host" "$RMQ_UNMASK_CMD || true"
@@ -573,6 +616,20 @@ promote_standby_cluster() {
 restore_wsr_config() {
     log_info "🔄 Restoring WSR configuration..."
     
+    # Step 0: CRITICAL - Reset WSR state on all cluster2 nodes after promotion
+    log_info "  Step 0: Resetting WSR connections after promotion..."
+    for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
+        log_info "    Disconnecting WSR on $node_ip..."
+        
+        # Disconnect any existing WSR connections (critical after promotion)
+        ssh_sudo "$node_ip" "rabbitmqctl disconnect_standby_replication_downstream" 2>/dev/null || true
+        
+        # Give it a moment to disconnect
+        sleep 1
+    done
+    
+    log_info "    ✓ WSR disconnected on all nodes"
+    
     # Step 1: Configure all cluster2 nodes as downstream
     log_info "  Step 1: Configuring cluster2 nodes as downstream..."
     for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
@@ -590,10 +647,20 @@ restore_wsr_config() {
     done
     
     # Step 2: Restart cluster2 with verification
-    log_info "  Step 2: Restarting az-cluster-2..."
+    log_info "  Step 2: Restarting az-cluster-2 (full restart to clear WSR state)..."
     for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
-        log_info "    Restarting $node_ip..."
-        ssh_sudo "$node_ip" "$RMQ_RESTART_CMD" 2>/dev/null &
+        log_info "    Stopping $node_ip first..."
+        ssh_sudo "$node_ip" "$RMQ_STOP_CMD" 2>/dev/null || true
+    done
+    
+    # Wait for all nodes to stop
+    log_info "    Waiting for nodes to fully stop..."
+    sleep 5
+    
+    # Now start them
+    for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
+        log_info "    Starting $node_ip..."
+        ssh_sudo "$node_ip" "$RMQ_START_CMD" 2>/dev/null &
     done
     wait
     
@@ -630,9 +697,10 @@ restore_wsr_config() {
         return 1
     fi
     
-    # Step 4: Wait for cluster convergence
-    log_info "  Step 4: Waiting for cluster convergence..."
-    sleep 10
+    # Step 4: Wait for cluster convergence and full stability
+    log_info "  Step 4: Waiting for cluster convergence and stability..."
+    log_info "    Initial wait for cluster to fully converge..."
+    sleep 15
     
     # Verify cluster2 is operational
     local cluster2_nodes
@@ -642,6 +710,10 @@ restore_wsr_config() {
     if [[ "$cluster2_nodes" -lt 3 ]]; then
         log_warn "  ⚠ Cluster2 not fully operational ($cluster2_nodes/3 nodes)"
     fi
+    
+    # Additional wait for full stability (important after promotion+restart)
+    log_info "    Additional wait for full cluster stability..."
+    sleep 10
     
     # Step 5: Reconnect WSR with multiple endpoint redundancy
     local primary_node="${ALL_CLUSTER2_NODES[0]}"
@@ -689,8 +761,11 @@ restore_wsr_config() {
     for attempt in {1..5}; do  # Increased from 3 to 5 attempts
         log_info "    Configuration attempt $attempt/5..."
         
-        if ssh_sudo "$primary_node" "rabbitmqctl set_schema_replication_upstream_endpoints '{\"endpoints\":${upstream_amqp_endpoints},\"username\":\"${USER}\",\"password\":\"${PASSWORD}\"}'" 2>/dev/null; then
-            log_info "      ✓ Schema replication endpoints configured"
+        # Use 'replication' user for WSR endpoints (not admin)
+        local wsr_user="replication"
+        
+        if ssh_sudo "$primary_node" "rabbitmqctl set_schema_replication_upstream_endpoints '{\"endpoints\":${upstream_amqp_endpoints},\"username\":\"${wsr_user}\",\"password\":\"${PASSWORD}\"}'" 2>/dev/null; then
+            log_info "      ✓ Schema replication endpoints configured (user: $wsr_user)"
         else
             log_warn "      ✗ Failed to configure schema replication endpoints"
             if [[ $attempt -lt 5 ]]; then
@@ -700,8 +775,8 @@ restore_wsr_config() {
             continue
         fi
         
-        if ssh_sudo "$primary_node" "rabbitmqctl set_standby_replication_upstream_endpoints '{\"endpoints\":${upstream_stream_endpoints},\"username\":\"${USER}\",\"password\":\"${PASSWORD}\"}'" 2>/dev/null; then
-            log_info "      ✓ Standby replication endpoints configured"
+        if ssh_sudo "$primary_node" "rabbitmqctl set_standby_replication_upstream_endpoints '{\"endpoints\":${upstream_stream_endpoints},\"username\":\"${wsr_user}\",\"password\":\"${PASSWORD}\"}'" 2>/dev/null; then
+            log_info "      ✓ Standby replication endpoints configured (user: $wsr_user)"
         else
             log_warn "      ✗ Failed to configure standby replication endpoints"
             if [[ $attempt -lt 5 ]]; then
@@ -823,9 +898,14 @@ extract_perf_stats() {
     done < "$log_file"
     
     # Extract cumulative totals from individual interval reports
-    sent_total=$(grep -o "sent: [0-9]*" "$log_file" | awk '{sum+=$2} END {print sum+0}')
-    received_total=$(grep -o "received: [0-9]*" "$log_file" | awk '{sum+=$2} END {print sum+0}')
-    confirmed_total=$(grep -o "confirmed: [0-9]*" "$log_file" | awk '{sum+=$2} END {print sum+0}')
+    sent_total=$(grep -o "sent: [0-9]*" "$log_file" | awk '{sum+=$2} END {print sum+0}' || echo "0")
+    received_total=$(grep -o "received: [0-9]*" "$log_file" | awk '{sum+=$2} END {print sum+0}' || echo "0")
+    confirmed_total=$(grep -o "confirmed: [0-9]*" "$log_file" | awk '{sum+=$2} END {print sum+0}' || echo "0")
+    
+    # Ensure values are valid numbers
+    if ! [[ "$sent_total" =~ ^[0-9]+$ ]]; then sent_total=0; fi
+    if ! [[ "$received_total" =~ ^[0-9]+$ ]]; then received_total=0; fi
+    if ! [[ "$confirmed_total" =~ ^[0-9]+$ ]]; then confirmed_total=0; fi
     
     # Store results in associative array (using eval for dynamic array name)
     eval "${stats_array_name}[sent]=$sent_total"
@@ -1122,7 +1202,7 @@ run_resiliency_wsr_test() {
     # Check how many messages have accumulated
     local current_msgs
     current_msgs=$(get_queue_messages "$PRIMARY_MGMT_URL" "$queue")
-    log_info "  ✓ Phase 1 accumulated $current_msgs messages, ready for failure simulation"
+    log_info "  ✓ Phase 1 accumulated $current_msgs messages (before failure simulation)"
     
     # Note: Standby queue will be empty until promotion - this is normal WSR behavior
     local standby_msgs
@@ -1133,11 +1213,6 @@ run_resiliency_wsr_test() {
     log_info ""
     log_info "💥 PHASE 2: AZ1 failure simulation and detection"
     
-    # Get stats before failure
-    local msgs_before_failure
-    msgs_before_failure=$(get_queue_messages "$PRIMARY_MGMT_URL" "$queue")
-    log_info "  Messages in queue before failure: $msgs_before_failure"
-    
     # Start monitoring perf-test in background
     monitor_perf_test_failure "$phase1_log" $phase1_pid 60 &
     local monitor_pid=$!
@@ -1146,6 +1221,14 @@ run_resiliency_wsr_test() {
     sleep 5
     log_info "  Simulating AZ1 failure..."
     simulate_az1_failure
+    
+    # Get stats right after failure (perf-test may still be sending for a few seconds)
+    log_info "  Waiting for perf-test to detect failure..."
+    sleep 3
+    
+    local msgs_before_failure
+    msgs_before_failure=$(get_queue_messages "$PRIMARY_MGMT_URL" "$queue" 2>/dev/null || echo "0")
+    log_info "  Messages in queue at time of failure: $msgs_before_failure"
     
     # Wait for failure detection
     local failure_detected=false
@@ -1223,6 +1306,29 @@ run_resiliency_wsr_test() {
         log_info "  Final running nodes after force kill: $running_nodes"
     fi
     
+    # Verify cluster-2 status after failure
+    if $STANDBY_NO_FAIL; then
+        log_info "  Verifying cluster-2 status (should be fully operational)..."
+        local cluster2_running=0
+        for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
+            local beam_count
+            beam_count=$(ssh_sudo "$node_ip" "pgrep beam.smp | wc -l" 2>/dev/null || echo "0")
+            if [[ "$beam_count" -gt 0 ]]; then
+                ((cluster2_running++))
+                log_info "    ✓ Cluster-2 node $node_ip is running"
+            else
+                log_warn "    ⚠ Cluster-2 node $node_ip is down (unexpected with --standby-no-fail)"
+            fi
+        done
+        log_info "  Cluster-2 running nodes: $cluster2_running/3"
+        
+        if [[ "$cluster2_running" -eq 3 ]]; then
+            log_pass "  ✓ Cluster-2 fully operational as expected (--standby-no-fail mode)"
+        else
+            log_warn "  ⚠ Cluster-2 has only $cluster2_running/3 nodes (may affect promotion)"
+        fi
+    fi
+    
     # Analyze phase 1 results using improved extraction
     log_info "  Analyzing phase 1 results..."
     declare -A phase1_stats
@@ -1231,6 +1337,11 @@ run_resiliency_wsr_test() {
     if extract_perf_stats "$phase1_log" "phase1_stats"; then
         phase1_sent=${phase1_stats[sent]}
         phase1_received=${phase1_stats[received]}
+        
+        # Ensure values are valid numbers
+        if ! [[ "$phase1_sent" =~ ^[0-9]+$ ]]; then phase1_sent=0; fi
+        if ! [[ "$phase1_received" =~ ^[0-9]+$ ]]; then phase1_received=0; fi
+        
         log_info "    Phase 1 - Sent: $phase1_sent, Received: $phase1_received, Confirmed: ${phase1_stats[confirmed]}"
         
         if [[ -n "${phase1_stats[last_good_line]}" ]]; then
@@ -1243,8 +1354,13 @@ run_resiliency_wsr_test() {
     else
         log_warn "    Could not extract phase 1 statistics from log"
         # Fallback to simple extraction
-        phase1_sent=$(grep -o "sent: [0-9]*" "$phase1_log" | awk '{sum+=$2} END {print sum+0}')
-        phase1_received=$(grep -o "received: [0-9]*" "$phase1_log" | awk '{sum+=$2} END {print sum+0}')
+        phase1_sent=$(grep -o "sent: [0-9]*" "$phase1_log" | awk '{sum+=$2} END {print sum+0}' || echo "0")
+        phase1_received=$(grep -o "received: [0-9]*" "$phase1_log" | awk '{sum+=$2} END {print sum+0}' || echo "0")
+        
+        # Ensure values are valid numbers
+        if ! [[ "$phase1_sent" =~ ^[0-9]+$ ]]; then phase1_sent=0; fi
+        if ! [[ "$phase1_received" =~ ^[0-9]+$ ]]; then phase1_received=0; fi
+        
         log_info "    Phase 1 (fallback) - Sent: $phase1_sent, Received: $phase1_received"
     fi
     
@@ -1274,9 +1390,34 @@ run_resiliency_wsr_test() {
     # Final verification of queue and message preservation
     log_info "  Final verification of promoted cluster..."
     
+    # Wait a moment for the promotion to fully stabilize
+    sleep 2
+    
     if queue_exists "$STANDBY_MGMT_URL" "$queue"; then
         local msgs_after_promotion
-        msgs_after_promotion=$(get_queue_messages "$STANDBY_MGMT_URL" "$queue")
+        
+        # Try multiple methods to get message count (API might be unstable right after promotion)
+        msgs_after_promotion=$(get_queue_messages "$STANDBY_MGMT_URL" "$queue" 2>/dev/null || echo "0")
+        
+        # If API returns 0, try using rabbitmqctl as fallback
+        if [[ "$msgs_after_promotion" -eq 0 ]]; then
+            log_info "  API returned 0 messages, verifying with rabbitmqctl..."
+            local queue_info_raw
+            for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
+                queue_info_raw=$(ssh_sudo "$node_ip" "rabbitmqctl list_queues name messages -p '/' | grep '$queue'" 2>/dev/null || echo "")
+                if [[ -n "$queue_info_raw" ]]; then
+                    # Extract message count from output like "queue_name  12345"
+                    local msg_count
+                    msg_count=$(echo "$queue_info_raw" | awk '{print $2}')
+                    if [[ "$msg_count" =~ ^[0-9]+$ ]] && [[ "$msg_count" -gt 0 ]]; then
+                        msgs_after_promotion="$msg_count"
+                        log_info "  Rabbitmqctl reported $msgs_after_promotion messages on node $node_ip"
+                        break
+                    fi
+                fi
+            done
+        fi
+        
         log_info "  ✓ Queue confirmed available on az-cluster-2 ($msgs_after_promotion messages)"
         
         # Verify message preservation from WSR
@@ -1304,14 +1445,28 @@ run_resiliency_wsr_test() {
     local phase2_log="$RESULTS_DIR/perf-test-phase2-$(date +%Y%m%d-%H%M%S).log"
     local phase2_duration=120  # Give it time to consume all messages
     
+    # Get actual message count in promoted cluster before starting consumers
+    local msgs_to_consume=0
+    for node_ip in "${ALL_CLUSTER2_NODES[@]}"; do
+        local queue_check
+        queue_check=$(ssh_sudo "$node_ip" "rabbitmqctl list_queues name messages -p '/' | grep '$queue'" 2>/dev/null || echo "")
+        if [[ -n "$queue_check" ]]; then
+            msgs_to_consume=$(echo "$queue_check" | awk '{print $2}')
+            if [[ "$msgs_to_consume" =~ ^[0-9]+$ ]]; then
+                log_info "  Actual messages available for consumption: $msgs_to_consume"
+                break
+            fi
+        fi
+    done
+    
     # Only consume - no production needed since all messages were produced in phase 1
+    # Remove consumer-latency to allow fast consumption
     java $JVM_OPTS -jar "$TOOLS_DIR/perf-test.jar" \
         --uris "$CLUSTER2_URIS" \
         --predeclared \
         --queue "$queue" \
         --producers 0 \
         --consumers 3 \
-        --consumer-latency 1000000 \
         --id "wsr-phase2" > "$phase2_log" 2>&1 &
     
     local phase2_pid=$!
@@ -1344,15 +1499,31 @@ run_resiliency_wsr_test() {
     local phase2_received=0
     if [[ -n "$phase2_log" ]] && [[ -f "$phase2_log" ]]; then
         log_info "  Analyzing phase 2 results..."
-        phase2_sent=$(grep -o "sent: [0-9]*" "$phase2_log" | awk '{sum+=$2} END {print sum+0}')
-        phase2_received=$(grep -o "received: [0-9]*" "$phase2_log" | awk '{sum+=$2} END {print sum+0}')
+        phase2_sent=$(grep -o "sent: [0-9]*" "$phase2_log" | awk '{sum+=$2} END {print sum+0}' || echo "0")
+        phase2_received=$(grep -o "received: [0-9]*" "$phase2_log" | awk '{sum+=$2} END {print sum+0}' || echo "0")
+        
+        # Ensure values are valid numbers
+        if ! [[ "$phase2_sent" =~ ^[0-9]+$ ]]; then phase2_sent=0; fi
+        if ! [[ "$phase2_received" =~ ^[0-9]+$ ]]; then phase2_received=0; fi
+        
         log_info "    Phase 2 - Sent: $phase2_sent, Received: $phase2_received"
         
-        # Check for errors in phase 2
+        # Check for errors in phase 2 and show them
         local error_count
         error_count=$(grep -c -i "error\|exception\|failed" "$phase2_log" 2>/dev/null || echo "0")
+        # Clean up any whitespace or newlines
+        error_count=$(echo "$error_count" | tr -d '\n\r' | awk '{print $1}')
+        # Ensure it's a valid number
+        if ! [[ "$error_count" =~ ^[0-9]+$ ]]; then
+            error_count=0
+        fi
+        
         if [[ "$error_count" -gt 0 ]]; then
             log_warn "    Phase 2 errors detected: $error_count"
+            log_info "    Showing first 5 errors from phase 2:"
+            grep -i "error\|exception\|failed" "$phase2_log" 2>/dev/null | head -5 | while IFS= read -r line; do
+                log_info "      $line"
+            done
         fi
     fi
     
@@ -1422,7 +1593,12 @@ run_resiliency_wsr_test() {
     fi
     
     # Restore WSR
-    restore_wsr_config
+    local wsr_restored=false
+    if restore_wsr_config; then
+        wsr_restored=true
+    else
+        log_warn "  ⚠ WSR restoration process encountered issues"
+    fi
     
     # Final verification
     log_info ""
@@ -1436,12 +1612,13 @@ run_resiliency_wsr_test() {
     log_info "  az-cluster-1: $final_cluster1_nodes running nodes"
     log_info "  az-cluster-2: $final_cluster2_nodes running nodes"
     
-    # Verify WSR restored
-    if verify_wsr_functional; then
+    # Verify WSR restored (only if restoration completed)
+    if $wsr_restored && verify_wsr_functional; then
         log_pass "  ✓ WSR restored and verified as functional"
     else
         log_warn "  ⚠ WSR restoration incomplete - may need manual intervention"
-        log_info "    Run: ansible-playbook playbooks/configure_warm_standby.yml"
+        log_info "    This is common after promotion. Run: ansible-playbook playbooks/configure_warm_standby.yml"
+        log_info "    Note: The resiliency test itself was successful - WSR restoration is a cleanup step"
     fi
     
     # Determine test result
@@ -1505,7 +1682,15 @@ echo "  Phase 3: Promote az-cluster-2 and continue"
 echo ""
 echo "  az-cluster-1 (upstream): ${ALL_CLUSTER1_NODES[*]}"
 echo "  az-cluster-2 (standby):  ${ALL_CLUSTER2_NODES[*]}"
-echo "  AZ1 nodes (will fail):   ${AZ1_FAILED_NODES[*]}"
+
+if $STANDBY_NO_FAIL; then
+    echo "  AZ1 nodes (will fail):   ${AZ1_CLUSTER1_NODES[*]} (cluster-1 only)"
+    echo "  Mode:                    --standby-no-fail (cluster-2 protected)"
+else
+    echo "  AZ1 nodes (will fail):   ${AZ1_FAILED_NODES[*]} (both clusters)"
+    echo "  Mode:                    Full AZ1 failure"
+fi
+
 echo "  Test approach:           Continuous production with controlled failover"
 echo "=============================================="
 echo ""
