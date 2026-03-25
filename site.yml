@@ -26,6 +26,25 @@
   ansible.builtin.import_playbook: playbooks/configure_latency.yml
   tags: [latency, network]
 
-- name: Configure Warm Standby Replication
-  ansible.builtin.import_playbook: playbooks/configure_warm_standby.yml
-  tags: [standby, federation, rmq]
+# ============================================
+# Create admin user (required before replication strategies)
+# ============================================
+- name: Configure Admin User
+  ansible.builtin.import_playbook: playbooks/configure_admin_user.yml
+  tags: [admin, rmq]
+
+- name: Install RabbitMQ Admin CLI Tool
+  ansible.builtin.import_playbook: playbooks/install_rabbitmqadmin.yml
+  tags: [admin, rmq]
+
+# Choose replication strategy (comment/uncomment as needed):
+
+# Option 1: Warm Standby Replication (WSR)
+# - name: Configure Warm Standby Replication
+#   ansible.builtin.import_playbook: playbooks/configure_warm_standby.yml
+#   tags: [standby, wsr, rmq]
+
+# Option 2: Federated Exchange
+- name: Configure Federated Exchange
+  ansible.builtin.import_playbook: playbooks/configure_federated_exchange.yml
+  tags: [federation, rmq]

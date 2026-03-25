@@ -1,0 +1,68 @@
+---
+# ============================================
+# Install RabbitMQ Admin Tool (rabbitmqadmin)
+# ============================================
+# This playbook downloads and installs rabbitmqadmin CLI tool on all RabbitMQ nodes.
+# rabbitmqadmin is served by the RabbitMQ Management plugin.
+#
+# PREREQUISITE: RabbitMQ must be installed and rabbitmq_management plugin must be enabled
+#
+- name: Install rabbitmqadmin CLI tool on all nodes
+  hosts: nodes
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Wait for RabbitMQ Management API to be available
+      ansible.builtin.uri:
+        url: "https://127.0.0.1:15671/api/overview"
+        method: GET
+        user: "{{ rabbitmq.admin_user }}"
+        password: "{{ rmq_password }}"
+        validate_certs: no
+        status_code: 200
+      register: api_check
+      until: api_check.status == 200
+      retries: 10
+      delay: 3
+      ignore_errors: true
+
+    - name: Download rabbitmqadmin from Management API
+      ansible.builtin.get_url:
+        url: "https://127.0.0.1:15671/cli/rabbitmqadmin"
+        dest: /usr/local/bin/rabbitmqadmin
+        mode: '0755'
+        validate_certs: no
+        force: yes
+        url_username: "{{ rabbitmq.admin_user }}"
+        url_password: "{{ rmq_password }}"
+      register: download_result
+      failed_when: false
+
+    - name: Verify rabbitmqadmin installation
+      ansible.builtin.command: rabbitmqadmin --version
+      register: version_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display rabbitmqadmin version
+      ansible.builtin.debug:
+        msg: "rabbitmqadmin installed: {{ version_check.stdout }}"
+      when: version_check.rc == 0
+
+    - name: Configure rabbitmqadmin default connection
+      ansible.builtin.copy:
+        dest: /root/.rabbitmqadmin.conf
+        content: |
+          [default]
+          hostname = 127.0.0.1
+          port = 15671
+          ssl = True
+          username = {{ rabbitmq.admin_user }}
+          password = {{ rmq_password }}
+          ssl_ca_cert_file = /etc/rabbitmq/tls/ca.crt
+          ssl_cert_file = /etc/rabbitmq/tls/server.crt
+          ssl_key_file = /etc/rabbitmq/tls/server.key
+        mode: '0600'
+        owner: root
+        group: root

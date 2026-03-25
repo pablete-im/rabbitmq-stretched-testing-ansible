@@ -1,6 +1,8 @@
 ---
 # Tanzu RabbitMQ Warm Standby Replication Configuration
 #
+# PREREQUISITE: Admin user MUST be created first via configure_admin_user.yml
+#
 # Fan-out topology from AZ-Cluster-1 (upstream):
 #   AZ-Cluster-1 → AZ-Cluster-2  (AZ region standby)
 #   AZ-Cluster-1 → TX-Cluster-1  (cross-region DR)
@@ -44,41 +46,7 @@
       changed_when: "'already enabled' not in result.stdout"
 
 # ============================================
-# Phase 2: Create admin user on ALL clusters BEFORE schema sync
-# ============================================
-# The admin user must exist on all clusters before schema_definition_sync is activated.
-# Once schema sync is running, it continuously enforces the schema baseline
-# captured at startup. Users added after sync is active get wiped.
-- name: Create admin user on all clusters
-  hosts: "{{ groups['az-cluster-1'][0] }},{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
-  become: true
-  vars:
-    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
-  tasks:
-    - name: Create admin user
-      ansible.builtin.command: >
-        rabbitmqctl add_user {{ rabbitmq.admin_user }} {{ rmq_password }}
-      register: result
-      changed_when: result.rc == 0
-      failed_when: result.rc != 0 and 'already exists' not in result.stderr
-
-    - name: Set admin user tags
-      ansible.builtin.command: rabbitmqctl set_user_tags {{ rabbitmq.admin_user }} administrator
-      changed_when: true
-
-    - name: Set admin permissions
-      ansible.builtin.command: >
-        rabbitmqctl set_permissions -p / {{ rabbitmq.admin_user }} ".*" ".*" ".*"
-      changed_when: true
-
-    - name: Delete guest user (security)
-      ansible.builtin.command: rabbitmqctl delete_user guest
-      register: guest_result
-      changed_when: guest_result.rc == 0
-      failed_when: false
-
-# ============================================
-# Phase 3: Configure upstream cluster (AZ-Cluster-1) config and restart
+# Phase 2: Configure upstream cluster (AZ-Cluster-1) config and restart
 # ============================================
 - name: Configure upstream cluster (AZ-Cluster-1) config
   hosts: az-cluster-1
@@ -171,10 +139,10 @@
       until: result.rc == 0
 
 # ============================================
-# Phase 4A: Create replication user on ALL clusters
+# Phase 3: Create replication user on ALL clusters
 # ============================================
 - name: Create replication user on all clusters
-  hosts: "{{ groups['az-cluster-1'][0] }},{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  hosts: pve-schwab-rmq01,pve-schwab-rmq04,pve-schwab-rmq07
   become: true
   vars:
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
@@ -207,10 +175,10 @@
       changed_when: true
 
 # ============================================
-# Phase 4B: Configure upstream replication settings
+# Phase 4: Configure upstream replication settings
 # ============================================
 - name: Configure upstream cluster replication
-  hosts: "{{ groups['az-cluster-1'][0] }}"
+  hosts: pve-schwab-rmq01
   become: true
   vars:
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
@@ -248,7 +216,7 @@
         msg: "{{ upstream_status.stdout_lines | default(['Status not available']) }}"
 
 # ============================================
-# Phase 5A: Write downstream config (all nodes, no restart yet)
+# Phase 5: Write downstream config (all nodes, no restart yet)
 # ============================================
 - name: Write downstream cluster config
   hosts: az-cluster-2:tx-cluster-1
@@ -407,10 +375,10 @@
         mode: '0644'   
 
 # ============================================
-# Phase 5B: Set schema replication endpoints BEFORE restart
+# Phase 6: Set schema replication endpoints BEFORE restart
 # ============================================
 - name: Set schema replication endpoints on all downstreams (pre-restart)
-  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  hosts: pve-schwab-rmq04,pve-schwab-rmq07
   become: true
   vars:
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
@@ -435,7 +403,7 @@
         var: global_params.stdout_lines
 
 # ============================================
-# Phase 5C: Restart downstream nodes (rolling)
+# Phase 7: Restart downstream nodes (rolling)
 # ============================================
 - name: Restart downstream clusters
   hosts: az-cluster-2:tx-cluster-1
@@ -457,10 +425,10 @@
       until: result.rc == 0
 
 # ============================================
-# Phase 6: Connect standby replication and verify
+# Phase 8: Connect standby replication and verify
 # ============================================
 - name: Connect all downstreams to upstream
-  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  hosts: pve-schwab-rmq04,pve-schwab-rmq07
   become: true
   vars:
     rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
@@ -505,10 +473,10 @@
         var: verify_result.stdout_lines
 
 # ============================================
-# Phase 7: Verify replication status
+# Phase 9: Verify replication status
 # ============================================
 - name: Verify all downstream replication
-  hosts: "{{ groups['az-cluster-2'][0] }},{{ groups['tx-cluster-1'][0] }}"
+  hosts: pve-schwab-rmq04,pve-schwab-rmq07
   become: true
   tasks:
     - name: Check standby replication status
@@ -542,7 +510,7 @@
         msg: "{{ recovery_vhosts.stdout_lines | default(['None available']) }}"
 
 # ============================================
-# Phase 8: Display summary
+# Phase 10: Display summary
 # ============================================
 - name: Display Summary
   hosts: localhost

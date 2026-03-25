@@ -1,0 +1,437 @@
+---
+# Tanzu RabbitMQ Federated Exchange Configuration
+#
+# PREREQUISITE: Admin user MUST be created first via configure_admin_user.yml
+#
+# Fan-out topology from AZ-Cluster-1 (upstream):
+#   AZ-Cluster-1 → AZ-Cluster-2  (AZ region standby)
+#   AZ-Cluster-1 → TX-Cluster-1  (cross-region DR)
+#
+# Failover scenarios:
+#   AZ-Cluster-1 failure  → Switch consumers to AZ-Cluster-2
+#   Arizona region failure → Switch consumers to TX-Cluster-1
+#
+# Federation approach:
+#   1. Exchange "federation-exchange" on AZ-Cluster-1 (upstream) with local queue
+#   2. Federated exchanges "federation-exchange" on downstream clusters pull from upstream
+#   3. Messages published to upstream exchange are automatically replicated to downstream
+
+# ============================================
+# Phase 1: Enable federation plugin on all nodes
+# ============================================
+- name: Enable federation plugin on all nodes
+  hosts: nodes
+  become: true
+  tasks:
+    - name: Enable management plugin
+      ansible.builtin.command: rabbitmq-plugins enable rabbitmq_management
+      register: result
+      changed_when: "'already enabled' not in result.stdout"
+
+    - name: Enable federation plugin
+      ansible.builtin.command: rabbitmq-plugins enable rabbitmq_federation rabbitmq_federation_management
+      register: result
+      changed_when: "'already enabled' not in result.stdout"
+
+# ============================================
+# Phase 2: Create replication user on first node of each cluster
+# ============================================
+- name: Create replication user on az-cluster-1
+  hosts: pve-schwab-rmq01
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Create replication user
+      ansible.builtin.command: >
+        rabbitmqctl add_user {{ rabbitmq.replication_user }} {{ rmq_password }}
+      register: result
+      changed_when: result.rc == 0
+      failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Set replication user tags
+      ansible.builtin.command: rabbitmqctl set_user_tags {{ rabbitmq.replication_user }} administrator
+      changed_when: true
+
+    - name: Set replication user permissions on default vhost
+      ansible.builtin.command: >
+        rabbitmqctl set_permissions -p / {{ rabbitmq.replication_user }} ".*" ".*" ".*"
+      changed_when: true
+
+- name: Create replication user on az-cluster-2
+  hosts: pve-schwab-rmq04
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Create replication user
+      ansible.builtin.command: >
+        rabbitmqctl add_user {{ rabbitmq.replication_user }} {{ rmq_password }}
+      register: result
+      changed_when: result.rc == 0
+      failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Set replication user tags
+      ansible.builtin.command: rabbitmqctl set_user_tags {{ rabbitmq.replication_user }} administrator
+      changed_when: true
+
+    - name: Set replication user permissions
+      ansible.builtin.command: >
+        rabbitmqctl set_permissions -p / {{ rabbitmq.replication_user }} ".*" ".*" ".*"
+      changed_when: true
+
+- name: Create replication user on tx-cluster-1
+  hosts: pve-schwab-rmq07
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Create replication user
+      ansible.builtin.command: >
+        rabbitmqctl add_user {{ rabbitmq.replication_user }} {{ rmq_password }}
+      register: result
+      changed_when: result.rc == 0
+      failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Set replication user tags
+      ansible.builtin.command: rabbitmqctl set_user_tags {{ rabbitmq.replication_user }} administrator
+      changed_when: true
+
+    - name: Set replication user permissions
+      ansible.builtin.command: >
+        rabbitmqctl set_permissions -p / {{ rabbitmq.replication_user }} ".*" ".*" ".*"
+      changed_when: true
+
+# ============================================
+# Phase 3: Create upstream exchange and queue on AZ-Cluster-1
+# ============================================
+- name: Configure upstream exchange and queue
+  hosts: pve-schwab-rmq01
+  become: true
+  tasks:
+    - name: Declare upstream fanout exchange via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare exchange
+        name=federation-exchange
+        type=fanout
+        durable=true
+      register: exchange_result
+      changed_when: "'exchange declared' in exchange_result.stdout or exchange_result.rc == 0"
+
+    - name: Declare upstream quorum queue via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare queue
+        name=federation-upstream-queue
+        durable=true
+        arguments='{"x-queue-type":"quorum"}'
+      register: queue_result
+      changed_when: "'queue declared' in queue_result.stdout or queue_result.rc == 0"
+
+    - name: Bind upstream queue to exchange via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare binding
+        source=federation-exchange
+        destination=federation-upstream-queue
+        destination_type=queue
+      register: binding_result
+      changed_when: "'binding declared' in binding_result.stdout or binding_result.rc == 0"
+
+    - name: Verify exchange created
+      ansible.builtin.command: rabbitmqctl list_exchanges name type durable
+      register: exchanges
+      changed_when: false
+
+    - name: Display exchanges
+      ansible.builtin.debug:
+        msg: "{{ exchanges.stdout_lines }}"
+
+    - name: Verify queue created
+      ansible.builtin.command: rabbitmqctl list_queues name type
+      register: queues
+      changed_when: false
+
+    - name: Display queues
+      ansible.builtin.debug:
+        msg: "{{ queues.stdout_lines }}"
+
+# ============================================
+# Phase 4: Configure federation upstream on downstream clusters
+# ============================================
+- name: Configure federation upstream on az-cluster-2
+  hosts: pve-schwab-rmq04
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Set federation upstream parameter with multiple URIs for HA
+      ansible.builtin.shell: >
+        rabbitmqctl set_parameter federation-upstream upstream-cluster
+        '{
+          "uri": [
+            "amqps://{{ rabbitmq.replication_user }}:{{ rmq_password }}@10.85.10.234:5671?cacertfile=/etc/rabbitmq/tls/ca.crt&certfile=/etc/rabbitmq/tls/server.crt&keyfile=/etc/rabbitmq/tls/server.key&verify=verify_none&auth_mechanism=plain",
+            "amqps://{{ rabbitmq.replication_user }}:{{ rmq_password }}@10.85.10.235:5671?cacertfile=/etc/rabbitmq/tls/ca.crt&certfile=/etc/rabbitmq/tls/server.crt&keyfile=/etc/rabbitmq/tls/server.key&verify=verify_none&auth_mechanism=plain",
+            "amqps://{{ rabbitmq.replication_user }}:{{ rmq_password }}@10.85.10.236:5671?cacertfile=/etc/rabbitmq/tls/ca.crt&certfile=/etc/rabbitmq/tls/server.crt&keyfile=/etc/rabbitmq/tls/server.key&verify=verify_none&auth_mechanism=plain"
+          ],
+          "ack-mode": "on-confirm",
+          "trust-user-id": false,
+          "max-hops": 1
+        }'
+      changed_when: true
+
+    - name: Verify federation upstream parameter
+      ansible.builtin.command: rabbitmqctl list_parameters
+      register: params
+      changed_when: false
+
+    - name: Display federation parameters
+      ansible.builtin.debug:
+        msg: "{{ params.stdout_lines }}"
+
+- name: Configure federation upstream on tx-cluster-1
+  hosts: pve-schwab-rmq07
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Set federation upstream parameter with multiple URIs for HA
+      ansible.builtin.shell: >
+        rabbitmqctl set_parameter federation-upstream upstream-cluster
+        '{
+          "uri": [
+            "amqps://{{ rabbitmq.replication_user }}:{{ rmq_password }}@10.85.10.234:5671?cacertfile=/etc/rabbitmq/tls/ca.crt&certfile=/etc/rabbitmq/tls/server.crt&keyfile=/etc/rabbitmq/tls/server.key&verify=verify_none&auth_mechanism=plain",
+            "amqps://{{ rabbitmq.replication_user }}:{{ rmq_password }}@10.85.10.235:5671?cacertfile=/etc/rabbitmq/tls/ca.crt&certfile=/etc/rabbitmq/tls/server.crt&keyfile=/etc/rabbitmq/tls/server.key&verify=verify_none&auth_mechanism=plain",
+            "amqps://{{ rabbitmq.replication_user }}:{{ rmq_password }}@10.85.10.236:5671?cacertfile=/etc/rabbitmq/tls/ca.crt&certfile=/etc/rabbitmq/tls/server.crt&keyfile=/etc/rabbitmq/tls/server.key&verify=verify_none&auth_mechanism=plain"
+          ],
+          "ack-mode": "on-confirm",
+          "trust-user-id": false,
+          "max-hops": 1
+        }'
+      changed_when: true
+
+    - name: Verify federation upstream parameter
+      ansible.builtin.command: rabbitmqctl list_parameters
+      register: params
+      changed_when: false
+
+    - name: Display federation parameters
+      ansible.builtin.debug:
+        msg: "{{ params.stdout_lines }}"
+
+# ============================================
+# Phase 5: Create federated exchange and queue on downstream clusters
+# ============================================
+- name: Configure downstream federated resources on az-cluster-2
+  hosts: pve-schwab-rmq04
+  become: true
+  tasks:
+    - name: Declare federated exchange on downstream via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare exchange
+        name=federation-exchange
+        type=fanout
+        durable=true
+      register: exchange_result
+      changed_when: "'exchange declared' in exchange_result.stdout or exchange_result.rc == 0"
+
+    - name: Declare downstream quorum queue via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare queue
+        name=federation-downstream-queue
+        durable=true
+        arguments='{"x-queue-type":"quorum"}'
+      register: queue_result
+      changed_when: "'queue declared' in queue_result.stdout or queue_result.rc == 0"
+
+    - name: Bind downstream queue to federated exchange via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare binding
+        source=federation-exchange
+        destination=federation-downstream-queue
+        destination_type=queue
+      register: binding_result
+      changed_when: "'binding declared' in binding_result.stdout or binding_result.rc == 0"
+
+    - name: Create federation policy to federate the exchange
+      ansible.builtin.command: >
+        rabbitmqctl set_policy --vhost / federation-policy
+        "^federation-exchange$"
+        '{"federation-upstream-set":"all"}'
+        --apply-to exchanges
+      changed_when: true
+
+    - name: Wait for federation to establish
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify federation status
+      ansible.builtin.shell: >
+        rabbitmqctl eval 'rabbit_federation_status:status().'
+      register: fed_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display federation status
+      ansible.builtin.debug:
+        msg: "{{ fed_status.stdout_lines | default(['Status not available']) }}"
+
+- name: Configure downstream federated resources on tx-cluster-1
+  hosts: pve-schwab-rmq07
+  become: true
+  tasks:
+    - name: Declare federated exchange on downstream via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare exchange
+        name=federation-exchange
+        type=fanout
+        durable=true
+      register: exchange_result
+      changed_when: "'exchange declared' in exchange_result.stdout or exchange_result.rc == 0"
+
+    - name: Declare downstream quorum queue via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare queue
+        name=federation-downstream-queue
+        durable=true
+        arguments='{"x-queue-type":"quorum"}'
+      register: queue_result
+      changed_when: "'queue declared' in queue_result.stdout or queue_result.rc == 0"
+
+    - name: Bind downstream queue to federated exchange via rabbitmqadmin
+      ansible.builtin.shell: >
+        rabbitmqadmin --ssl-insecure declare binding
+        source=federation-exchange
+        destination=federation-downstream-queue
+        destination_type=queue
+      register: binding_result
+      changed_when: "'binding declared' in binding_result.stdout or binding_result.rc == 0"
+
+    - name: Create federation policy to federate the exchange
+      ansible.builtin.command: >
+        rabbitmqctl set_policy --vhost / federation-policy
+        "^federation-exchange$"
+        '{"federation-upstream-set":"all"}'
+        --apply-to exchanges
+      changed_when: true
+
+    - name: Wait for federation to establish
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify federation status
+      ansible.builtin.shell: >
+        rabbitmqctl eval 'rabbit_federation_status:status().'
+      register: fed_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display federation status
+      ansible.builtin.debug:
+        msg: "{{ fed_status.stdout_lines | default(['Status not available']) }}"
+
+# ============================================
+# Phase 6: Final verification
+# ============================================
+- name: Verify federation configuration on az-cluster-2
+  hosts: pve-schwab-rmq04
+  become: true
+  tasks:
+    - name: List exchanges
+      ansible.builtin.command: rabbitmqctl list_exchanges name type
+      register: exchanges
+      changed_when: false
+
+    - name: Display exchanges
+      ansible.builtin.debug:
+        msg: "{{ exchanges.stdout_lines }}"
+
+    - name: List queues
+      ansible.builtin.command: rabbitmqctl list_queues name type
+      register: queues
+      changed_when: false
+
+    - name: Display queues
+      ansible.builtin.debug:
+        msg: "{{ queues.stdout_lines }}"
+
+    - name: List policies
+      ansible.builtin.command: rabbitmqctl list_policies
+      register: policies
+      changed_when: false
+
+    - name: Display policies
+      ansible.builtin.debug:
+        msg: "{{ policies.stdout_lines }}"
+
+    - name: Check federation links via rabbitmqctl
+      ansible.builtin.command: rabbitmqctl list_parameters
+      register: fed_params
+      changed_when: false
+
+    - name: Display federation parameters
+      ansible.builtin.debug:
+        msg: "{{ fed_params.stdout_lines }}"
+
+- name: Verify federation configuration on tx-cluster-1
+  hosts: pve-schwab-rmq07
+  become: true
+  tasks:
+    - name: List exchanges
+      ansible.builtin.command: rabbitmqctl list_exchanges name type
+      register: exchanges
+      changed_when: false
+
+    - name: Display exchanges
+      ansible.builtin.debug:
+        msg: "{{ exchanges.stdout_lines }}"
+
+    - name: List queues
+      ansible.builtin.command: rabbitmqctl list_queues name type
+      register: queues
+      changed_when: false
+
+    - name: Display queues
+      ansible.builtin.debug:
+        msg: "{{ queues.stdout_lines }}"
+
+    - name: List policies
+      ansible.builtin.command: rabbitmqctl list_policies
+      register: policies
+      changed_when: false
+
+    - name: Display policies
+      ansible.builtin.debug:
+        msg: "{{ policies.stdout_lines }}"
+
+    - name: Check federation links via rabbitmqctl
+      ansible.builtin.command: rabbitmqctl list_parameters
+      register: fed_params
+      changed_when: false
+
+    - name: Display federation parameters
+      ansible.builtin.debug:
+        msg: "{{ fed_params.stdout_lines }}"
+
+- name: Final verification summary
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Show completion message
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "Federation Configuration Complete"
+          - "============================================"
+          - ""
+          - "Upstream cluster (az-cluster-1):"
+          - "  - Exchange: federation-upstream-exchange (fanout)"
+          - "  - Queue: federation-upstream-queue (quorum)"
+          - ""
+          - "Downstream clusters (az-cluster-2, tx-cluster-1):"
+          - "  - Federated Exchange: federation-upstream-exchange"
+          - "  - Queue: federation-downstream-queue (quorum)"
+          - ""
+          - "Messages published to federation-upstream-exchange on az-cluster-1"
+          - "will be automatically forwarded to downstream clusters."
+          - ""
+          - "To test, run:"
+          - "  ./perf-tests/test-resiliency-federation.sh"

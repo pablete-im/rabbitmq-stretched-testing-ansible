@@ -1,0 +1,55 @@
+---
+# ============================================
+# Configure Admin User Playbook
+# ============================================
+# This playbook MUST be executed BEFORE any replication strategy playbook
+# (configure_warm_standby.yml or configure_federated_exchange.yml).
+#
+# Why this is critical:
+#   - For WSR: schema_definition_sync enforces schema baseline captured at startup.
+#     Users added after sync is active get wiped. Admin must exist before sync starts.
+#   - For Federation: Management API and federation links require admin user.
+#   - General: All clusters need the admin user for management operations.
+#
+# This playbook creates the admin user on one node per cluster, which then
+# propagates to all nodes in that cluster automatically.
+#
+# ============================================
+# Create admin user on ALL clusters
+# ============================================
+- name: Create admin user on all clusters
+  hosts: pve-schwab-rmq01,pve-schwab-rmq04,pve-schwab-rmq07
+  become: true
+  vars:
+    rmq_password: "{{ vault_rmq_admin_password | default('changeme') }}"
+  tasks:
+    - name: Create admin user
+      ansible.builtin.command: >
+        rabbitmqctl add_user {{ rabbitmq.admin_user }} {{ rmq_password }}
+      register: result
+      changed_when: result.rc == 0
+      failed_when: result.rc != 0 and 'already exists' not in result.stderr
+
+    - name: Set admin user tags
+      ansible.builtin.command: rabbitmqctl set_user_tags {{ rabbitmq.admin_user }} administrator
+      changed_when: true
+
+    - name: Set admin permissions
+      ansible.builtin.command: >
+        rabbitmqctl set_permissions -p / {{ rabbitmq.admin_user }} ".*" ".*" ".*"
+      changed_when: true
+
+    - name: Delete guest user (security)
+      ansible.builtin.command: rabbitmqctl delete_user guest
+      register: guest_result
+      changed_when: guest_result.rc == 0
+      failed_when: false
+
+    - name: Verify admin user creation
+      ansible.builtin.command: rabbitmqctl list_users
+      register: user_list
+      changed_when: false
+
+    - name: Display created users
+      ansible.builtin.debug:
+        msg: "{{ user_list.stdout_lines }}"
