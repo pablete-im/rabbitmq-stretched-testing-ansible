@@ -45,6 +45,6 @@
 #   tags: [standby, wsr, rmq]
 
 # Option 2: Federated Exchange
-- name: Configure Federated Exchange
-  ansible.builtin.import_playbook: playbooks/configure_federated_exchange.yml
-  tags: [federation, rmq]
+# - name: Configure Federated Exchange
+#   ansible.builtin.import_playbook: playbooks/configure_federated_exchange.yml
+#  tags: [federation, rmq]

@@ -195,6 +195,11 @@
       ansible.builtin.command: rabbitmq-plugins enable rabbitmq_management
       changed_when: false # It handles idempotency well enough usually
 
+    - name: Enable Stream Plugins
+      ansible.builtin.command: rabbitmq-plugins enable rabbitmq_stream rabbitmq_stream_management
+      register: result
+      changed_when: "'already enabled' not in result.stdout"
+
     # 8. Start Service
     - name: Enable and Start RabbitMQ Service
       ansible.builtin.systemd:
